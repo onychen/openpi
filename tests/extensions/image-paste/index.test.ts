@@ -4,9 +4,13 @@ import { existsSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import type { KeybindingsManager } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+  KeybindingsManager,
+} from "@earendil-works/pi-coding-agent";
 import type { EditorComponent } from "@earendil-works/pi-tui";
-import {
+import imagePaste, {
   ImageAttachmentEditor,
   ImageAttachmentStore,
   transformImageAttachmentInput,
@@ -83,8 +87,36 @@ class FakeEditor implements EditorComponent {
 
 const keybindings = {
   matches: (data: string, action: string) =>
-    data === "BACKSPACE" && action === "tui.editor.deleteCharBackward",
+    (data === "BACKSPACE" && action === "tui.editor.deleteCharBackward") ||
+    (data === "ALT_ENTER" && action === "app.message.followUp"),
 } as unknown as KeybindingsManager;
+
+type Handler = (event: unknown, ctx: ExtensionContext) => unknown;
+
+function imagePasteHarness(attachments: ImageAttachmentStore) {
+  const handlers = new Map<string, Handler[]>();
+  const pi = {
+    on(event: string, handler: Handler) {
+      handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+    },
+  } as unknown as ExtensionAPI;
+  const ctx = {
+    ui: {
+      notify() {},
+    },
+  } as unknown as ExtensionContext;
+  imagePaste(pi, attachments);
+
+  return {
+    async emit(event: string, value: unknown) {
+      let result: unknown;
+      for (const handler of handlers.get(event) ?? []) {
+        result = await handler(value, ctx);
+      }
+      return result;
+    },
+  };
+}
 
 test("clipboard images become compact ordered placeholders and native image content", () => {
   const first = temporaryImage("png", "first");
@@ -157,6 +189,7 @@ test("Alt+Enter paths retain images after Pi clears the editor first", () => {
     editor.insertTextAtCursor("send ");
     editor.insertTextAtCursor(path);
     const submittedText = editor.getText();
+    editor.handleInput("ALT_ENTER");
     editor.setText("");
 
     let transformed: ReturnType<typeof transformImageAttachmentInput>;
@@ -208,6 +241,79 @@ test("submitted images survive until Pi emits the delayed input event", async ()
   assert.equal(
     transformed?.images[0]?.data,
     Buffer.from("delayed").toString("base64"),
+  );
+  assert.equal(existsSync(path), false);
+});
+
+test("a compaction retry discards attachment ownership before later input", async () => {
+  const path = temporaryImage("png", "compaction");
+  const store = new ImageAttachmentStore();
+  const harness = imagePasteHarness(store);
+  const base = new FakeEditor();
+  const editor = new ImageAttachmentEditor(base, keybindings, store);
+
+  editor.insertTextAtCursor(path);
+  editor.onSubmit = async () => {};
+  base.submit();
+
+  // Pi's compaction retry path sends the queued text with steer()/followUp(),
+  // bypassing the input event that would normally consume this submission.
+  await harness.emit("session_compact", { willRetry: true });
+  const transformed = await harness.emit("input", {
+    text: "[Image #1]",
+    source: "interactive",
+  });
+
+  assert.deepEqual(transformed, { action: "continue" });
+  assert.equal(existsSync(path), false);
+});
+
+test("placeholder text cannot select a different pending submission", () => {
+  const path = temporaryImage("png", "pending");
+  const store = new ImageAttachmentStore();
+  const base = new FakeEditor();
+  const editor = new ImageAttachmentEditor(base, keybindings, store);
+
+  editor.insertTextAtCursor("describe ");
+  editor.insertTextAtCursor(path);
+  editor.onSubmit = async () => {};
+  base.submit();
+
+  const transformed = transformImageAttachmentInput(store, {
+    text: "Explain the literal token [Image #1]",
+    source: "interactive",
+  });
+
+  assert.equal(transformed, undefined);
+  assert.equal(existsSync(path), true);
+  store.cleanup();
+  assert.equal(existsSync(path), false);
+});
+
+test("streaming Alt+Enter survives an asynchronous preceding input handler", async () => {
+  const path = temporaryImage("png", "async-handler");
+  const store = new ImageAttachmentStore();
+  const base = new FakeEditor();
+  const editor = new ImageAttachmentEditor(base, keybindings, store);
+
+  editor.insertTextAtCursor("send ");
+  editor.insertTextAtCursor(path);
+  const submittedText = editor.getText();
+  editor.handleInput("ALT_ENTER");
+  editor.setText("");
+
+  // ExtensionRunner awaits input handlers in registration order. An earlier
+  // asynchronous handler must not let editor cleanup win the race.
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const transformed = transformImageAttachmentInput(store, {
+    text: submittedText,
+    source: "interactive",
+  });
+
+  assert.equal(transformed?.text, "send [Image #1]");
+  assert.equal(
+    transformed?.images[0]?.data,
+    Buffer.from("async-handler").toString("base64"),
   );
   assert.equal(existsSync(path), false);
 });

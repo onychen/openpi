@@ -156,24 +156,21 @@ export class ImageAttachmentStore {
     }
   }
 
-  consumeSubmission(text: string) {
-    let submission =
-      [...this.pending.values()].find((candidate) => candidate.text === text) ??
-      [...this.pending.values()].find((candidate) =>
-        candidate.attachments.every((attachment) =>
-          text.includes(attachment.placeholder),
-        ),
-      );
-    // Pi's streaming Alt+Enter path clears the editor and calls session.prompt
-    // directly, bypassing the editor's onSubmit callback. Claim the surviving
-    // draft here so that path still reaches the native input event boundary.
-    if (!submission) {
-      const submissionId = this.beginSubmission(text);
-      if (submissionId !== undefined) {
-        submission = this.pending.get(submissionId);
+  discardPendingSubmissions() {
+    for (const submission of this.pending.values()) {
+      for (const attachment of submission.attachments) {
+        removeTemporaryImage(attachment.path);
       }
     }
-    if (!submission) return undefined;
+    this.pending.clear();
+  }
+
+  consumeSubmission(text: string) {
+    // Pi preserves interactive submission order. Consume that lifecycle-owned
+    // identity instead of letting repeated placeholder text select any older
+    // pending attachment.
+    const submission = this.pending.values().next().value;
+    if (!submission || submission.text !== text) return undefined;
     this.pending.delete(submission.id);
 
     const ordered = [...submission.attachments].sort(
@@ -225,13 +222,8 @@ export class ImageAttachmentStore {
     for (const attachment of this.draft.values()) {
       removeTemporaryImage(attachment.path);
     }
-    for (const submission of this.pending.values()) {
-      for (const attachment of submission.attachments) {
-        removeTemporaryImage(attachment.path);
-      }
-    }
     this.draft.clear();
-    this.pending.clear();
+    this.discardPendingSubmissions();
     this.nextAttachmentId = 1;
     this.nextSubmissionId = 1;
   }
@@ -260,6 +252,7 @@ export class ImageAttachmentEditor extends BelowEditorNavigationEditor {
   private readonly attachments: ImageAttachmentStore;
   private downstreamChange?: (text: string) => void;
   private downstreamSubmit?: (text: string) => void;
+  private preparedSubmissionId?: number;
   private settingText = false;
 
   constructor(
@@ -310,7 +303,8 @@ export class ImageAttachmentEditor extends BelowEditorNavigationEditor {
     this.downstreamSubmit = value;
     super.onSubmit = value
       ? (text) => {
-          const submissionId = this.attachments.beginSubmission(text);
+          const submissionId =
+            this.preparedSubmissionId ?? this.attachments.beginSubmission(text);
           let outcome: unknown;
           try {
             outcome = value(text);
@@ -344,8 +338,6 @@ export class ImageAttachmentEditor extends BelowEditorNavigationEditor {
     if (text.length > 0) {
       this.attachments.reconcileDraft(text);
     } else if (this.attachments.hasDraft) {
-      // Alt+Enter clears the editor immediately before submitting. Let the
-      // same-turn submit/input handler claim the draft before reconciling it.
       setTimeout(() => this.attachments.reconcileDraft(this.getText()), 0);
     }
   }
@@ -382,6 +374,23 @@ export class ImageAttachmentEditor extends BelowEditorNavigationEditor {
   }
 
   override handleInput(data: string) {
+    if (
+      this.attachments.hasDraft &&
+      this.editorKeybindings.matches(data, "app.message.followUp")
+    ) {
+      // Alt+Enter reaches this editor before Pi clears it, but its streaming
+      // path bypasses onSubmit. Move ownership at the key action boundary.
+      const submissionId = this.attachments.beginSubmission(
+        this.getText().trim(),
+      );
+      this.preparedSubmissionId = submissionId;
+      try {
+        super.handleInput(data);
+      } finally {
+        this.preparedSubmissionId = undefined;
+      }
+      return;
+    }
     if (
       (this.editorKeybindings.matches(data, "tui.editor.deleteCharBackward") ||
         matchesKey(data, "shift+backspace")) &&
@@ -432,9 +441,10 @@ function installImagePasteEditor(
   });
 }
 
-export default function imagePaste(pi: ExtensionAPI) {
-  const attachments = new ImageAttachmentStore();
-
+export default function imagePaste(
+  pi: ExtensionAPI,
+  attachments = new ImageAttachmentStore(),
+) {
   pi.on("session_start", (_event, ctx) => {
     installImagePasteEditor(pi, ctx, attachments);
   });
@@ -453,6 +463,15 @@ export default function imagePaste(pi: ExtensionAPI) {
       text: transformed.text,
       images: transformed.images,
     };
+  });
+
+  pi.on("session_compact", (event) => {
+    if (event.willRetry) {
+      // InteractiveMode flushes retry-bound compaction messages through
+      // steer()/followUp(), which bypasses the input event. Those submissions
+      // therefore cannot retain attachment ownership.
+      attachments.discardPendingSubmissions();
+    }
   });
 
   pi.on("session_shutdown", () => {
