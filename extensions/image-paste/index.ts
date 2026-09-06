@@ -97,29 +97,38 @@ export class ImageAttachmentStore {
     const mimeType = mimeTypeForPath(path);
     if (!mimeType || !isPiClipboardImage(path)) return undefined;
 
-    let placeholder = `[Image #${this.nextAttachmentId}]`;
-    while (editorText.includes(placeholder)) {
-      this.nextAttachmentId += 1;
-      placeholder = `[Image #${this.nextAttachmentId}]`;
-    }
+    let id = this.nextAttachmentId;
+    while (this.draft.has(id) || editorText.includes(`[Image #${id}]`)) id += 1;
+    const placeholder = `[Image #${id}]`;
     const attachment = {
-      id: this.nextAttachmentId,
+      id,
       placeholder,
       path,
       mimeType,
     } satisfies Attachment;
-    this.nextAttachmentId += 1;
+    this.nextAttachmentId = id + 1;
     this.draft.set(attachment.id, attachment);
     return placeholder;
   }
 
   reconcileDraft(text: string) {
+    const occurrenceCounts = new Map<number, number>();
+    for (const occurrence of placeholderOccurrences(text)) {
+      occurrenceCounts.set(
+        occurrence.id,
+        (occurrenceCounts.get(occurrence.id) ?? 0) + 1,
+      );
+    }
     for (const [id, attachment] of this.draft) {
-      if (text.includes(attachment.placeholder)) continue;
+      // Placeholder text is user-editable, so only an unambiguous single
+      // occurrence may retain ownership of a temporary image. Duplicated or
+      // removed tokens become ordinary text and the image is cleaned up.
+      if (occurrenceCounts.get(id) === 1) continue;
       this.draft.delete(id);
       removeTemporaryImage(attachment.path);
     }
-    if (this.draft.size === 0) this.nextAttachmentId = 1;
+    this.nextAttachmentId =
+      this.draft.size === 0 ? 1 : Math.max(...this.draft.keys()) + 1;
   }
 
   beginSubmission(text: string) {
@@ -148,13 +157,22 @@ export class ImageAttachmentStore {
   }
 
   consumeSubmission(text: string) {
-    const submission =
+    let submission =
       [...this.pending.values()].find((candidate) => candidate.text === text) ??
       [...this.pending.values()].find((candidate) =>
         candidate.attachments.every((attachment) =>
           text.includes(attachment.placeholder),
         ),
       );
+    // Pi's streaming Alt+Enter path clears the editor and calls session.prompt
+    // directly, bypassing the editor's onSubmit callback. Claim the surviving
+    // draft here so that path still reaches the native input event boundary.
+    if (!submission) {
+      const submissionId = this.beginSubmission(text);
+      if (submissionId !== undefined) {
+        submission = this.pending.get(submissionId);
+      }
+    }
     if (!submission) return undefined;
     this.pending.delete(submission.id);
 
@@ -172,12 +190,12 @@ export class ImageAttachmentStore {
           data: readFileSync(attachment.path).toString("base64"),
           mimeType: attachment.mimeType,
         });
+      } catch {
+        failures.push(attachment.placeholder);
         transformedText = transformedText.replaceAll(
           attachment.placeholder,
           "",
         );
-      } catch {
-        failures.push(attachment.placeholder);
       } finally {
         removeTemporaryImage(attachment.path);
       }
@@ -271,8 +289,12 @@ export class ImageAttachmentEditor extends BelowEditorNavigationEditor {
   override set onChange(value: ((text: string) => void) | undefined) {
     this.downstreamChange = value;
     super.onChange = (text) => {
-      if (!this.settingText && text.length === 0 && this.attachments.hasDraft) {
-        queueMicrotask(() => this.attachments.reconcileDraft(this.getText()));
+      if (this.settingText) {
+        this.downstreamChange?.(text);
+        return;
+      }
+      if (text.length === 0 && this.attachments.hasDraft) {
+        setTimeout(() => this.attachments.reconcileDraft(this.getText()), 0);
       } else {
         this.attachments.reconcileDraft(text);
       }
@@ -299,9 +321,13 @@ export class ImageAttachmentEditor extends BelowEditorNavigationEditor {
             throw error;
           }
           if (submissionId !== undefined) {
-            void Promise.resolve(outcome).then(
-              () => this.attachments.finishSubmission(submissionId),
-              () => this.attachments.finishSubmission(submissionId),
+            // A fulfilled Pi submit callback only means that the editor accepted
+            // the text. The interactive loop may have queued it and emit the
+            // input event later, so successful settlement is not terminal
+            // evidence for the attachment. Input consumption owns success
+            // cleanup; rejection and session shutdown own the other paths.
+            void Promise.resolve(outcome).catch(() =>
+              this.attachments.finishSubmission(submissionId),
             );
           }
         }
@@ -315,7 +341,13 @@ export class ImageAttachmentEditor extends BelowEditorNavigationEditor {
     } finally {
       this.settingText = false;
     }
-    this.attachments.reconcileDraft(text);
+    if (text.length > 0) {
+      this.attachments.reconcileDraft(text);
+    } else if (this.attachments.hasDraft) {
+      // Alt+Enter clears the editor immediately before submitting. Let the
+      // same-turn submit/input handler claim the draft before reconciling it.
+      setTimeout(() => this.attachments.reconcileDraft(this.getText()), 0);
+    }
   }
 
   override insertTextAtCursor(text: string) {

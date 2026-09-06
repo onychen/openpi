@@ -108,7 +108,7 @@ test("clipboard images become compact ordered placeholders and native image cont
   };
   base.submit();
 
-  assert.equal(transformed?.text, "before  between ");
+  assert.equal(transformed?.text, "before [Image #1] between [Image #2]");
   assert.deepEqual(
     transformed?.images.map(({ data, mimeType }) => ({ data, mimeType })),
     [
@@ -147,6 +147,71 @@ test("backspace anywhere in an image placeholder removes it atomically", () => {
   assert.equal(existsSync(path), false);
 });
 
+test("Alt+Enter paths retain images after Pi clears the editor first", () => {
+  for (const pathKind of ["idle", "streaming"] as const) {
+    const path = temporaryImage("png", pathKind);
+    const store = new ImageAttachmentStore();
+    const base = new FakeEditor();
+    const editor = new ImageAttachmentEditor(base, keybindings, store);
+
+    editor.insertTextAtCursor("send ");
+    editor.insertTextAtCursor(path);
+    const submittedText = editor.getText();
+    editor.setText("");
+
+    let transformed: ReturnType<typeof transformImageAttachmentInput>;
+    if (pathKind === "idle") {
+      editor.onSubmit = (text) => {
+        transformed = transformImageAttachmentInput(store, {
+          text,
+          source: "interactive",
+        });
+      };
+      editor.onSubmit(submittedText);
+    } else {
+      transformed = transformImageAttachmentInput(store, {
+        text: submittedText,
+        source: "interactive",
+      });
+    }
+
+    assert.equal(transformed?.text, "send [Image #1]");
+    assert.equal(
+      transformed?.images[0]?.data,
+      Buffer.from(pathKind).toString("base64"),
+    );
+    assert.equal(existsSync(path), false);
+  }
+});
+
+test("submitted images survive until Pi emits the delayed input event", async () => {
+  const path = temporaryImage("png", "delayed");
+  const store = new ImageAttachmentStore();
+  const base = new FakeEditor();
+  const editor = new ImageAttachmentEditor(base, keybindings, store);
+
+  editor.insertTextAtCursor("describe ");
+  editor.insertTextAtCursor(path);
+  const submittedText = editor.getText();
+  editor.onSubmit = async () => {};
+  base.submit();
+
+  // Pi may queue the text in pendingUserInputs and resolve onSubmit before its
+  // main loop reaches session.prompt(), which is where the input event fires.
+  await Promise.resolve();
+  const transformed = transformImageAttachmentInput(store, {
+    text: submittedText,
+    source: "interactive",
+  });
+
+  assert.equal(transformed?.text, "describe [Image #1]");
+  assert.equal(
+    transformed?.images[0]?.data,
+    Buffer.from("delayed").toString("base64"),
+  );
+  assert.equal(existsSync(path), false);
+});
+
 test("ordinary paths and unregistered placeholder text stay ordinary text", () => {
   const store = new ImageAttachmentStore();
   const base = new FakeEditor();
@@ -163,8 +228,98 @@ test("ordinary paths and unregistered placeholder text stay ordinary text", () =
   );
 });
 
-test("removing the draft or ending the session cleans temporary images", () => {
+test("duplicating a placeholder makes both copies ordinary text", () => {
+  const path = temporaryImage("png", "image");
+  const store = new ImageAttachmentStore();
+  const base = new FakeEditor();
+  const editor = new ImageAttachmentEditor(base, keybindings, store);
+
+  editor.insertTextAtCursor(path);
+  editor.insertTextAtCursor(" [Image #1]");
+
+  assert.equal(editor.getText(), "[Image #1] [Image #1]");
+  assert.equal(existsSync(path), false);
+  assert.equal(
+    transformImageAttachmentInput(store, {
+      text: editor.getText(),
+      source: "interactive",
+    }),
+    undefined,
+  );
+});
+
+test("deleting the last image makes its number available to the next paste", () => {
+  const first = temporaryImage("png", "first");
+  const second = temporaryImage("png", "second");
+  const third = temporaryImage("png", "third");
+  const store = new ImageAttachmentStore();
+  const base = new FakeEditor();
+  const editor = new ImageAttachmentEditor(base, keybindings, store);
+
+  editor.insertTextAtCursor(first);
+  editor.insertTextAtCursor(" ");
+  editor.insertTextAtCursor(second);
+  assert.equal(editor.getText(), "[Image #1] [Image #2]");
+
+  base.cursor = editor.getText().length;
+  editor.handleInput("BACKSPACE");
+  assert.equal(editor.getText(), "[Image #1] ");
+  assert.equal(existsSync(second), false);
+
+  base.cursor = editor.getText().length;
+  editor.insertTextAtCursor(third);
+  assert.equal(editor.getText(), "[Image #1] [Image #2]");
+  store.cleanup();
+});
+
+test("deleting an earlier image does not reorder later image numbers", () => {
+  const first = temporaryImage("png", "first");
+  const second = temporaryImage("png", "second");
+  const third = temporaryImage("png", "third");
+  const store = new ImageAttachmentStore();
+  const base = new FakeEditor();
+  const editor = new ImageAttachmentEditor(base, keybindings, store);
+
+  editor.insertTextAtCursor(first);
+  editor.insertTextAtCursor(" ");
+  editor.insertTextAtCursor(second);
+  base.cursor = "[Image #1]".length;
+  editor.handleInput("BACKSPACE");
+
+  assert.equal(editor.getText(), " [Image #2]");
+  base.cursor = editor.getText().length;
+  editor.insertTextAtCursor(" ");
+  editor.insertTextAtCursor(third);
+  assert.equal(editor.getText(), " [Image #2] [Image #3]");
+  store.cleanup();
+});
+
+test("a failed image read removes the dangling placeholder", () => {
+  const path = temporaryImage("png", "image");
+  const store = new ImageAttachmentStore();
+  const base = new FakeEditor();
+  const editor = new ImageAttachmentEditor(base, keybindings, store);
+
+  editor.insertTextAtCursor("before ");
+  editor.insertTextAtCursor(path);
+  editor.insertTextAtCursor(" after");
+  const text = editor.getText();
+  const submissionId = store.beginSubmission(text);
+  assert.notEqual(submissionId, undefined);
+  rmSync(path, { force: true });
+
+  const transformed = transformImageAttachmentInput(store, {
+    text,
+    source: "interactive",
+  });
+  assert.equal(transformed?.text, "before  after");
+  assert.deepEqual(transformed?.images, []);
+  assert.deepEqual(transformed?.failures, ["[Image #1]"]);
+});
+
+test("removing the draft or ending the session cleans temporary images", async () => {
   const removed = temporaryImage("png", "removed");
+  const pending = temporaryImage("png", "pending");
   const shutdown = temporaryImage("png", "shutdown");
   const store = new ImageAttachmentStore();
   const base = new FakeEditor();
@@ -172,12 +327,21 @@ test("removing the draft or ending the session cleans temporary images", () => {
 
   editor.insertTextAtCursor(removed);
   editor.setText("");
+  await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(existsSync(removed), false);
+
+  editor.insertTextAtCursor(pending);
+  editor.onSubmit = async () => {};
+  base.submit();
+  await Promise.resolve();
+  assert.equal(existsSync(pending), true);
 
   editor.insertTextAtCursor(shutdown);
   store.cleanup();
+  assert.equal(existsSync(pending), false);
   assert.equal(existsSync(shutdown), false);
 
   rmSync(removed, { force: true });
+  rmSync(pending, { force: true });
   rmSync(shutdown, { force: true });
 });
