@@ -31,6 +31,7 @@ import {
 import { SPINNER_INTERVAL_MS, spinnerFrame } from "../shared/spinner.ts";
 import { sanitizeTerminalText } from "../shared/terminal-text.ts";
 import { isAcceptanceLedger } from "./acceptance.ts";
+import { recoverPendingWorkflowCommit } from "./artifacts.ts";
 import { projectWorkflowGraph } from "./graph-projection.ts";
 import {
   classifyInterruptedInvocation,
@@ -161,6 +162,7 @@ function normalizeReadRecord(runId: string, raw: unknown) {
 }
 
 function readPersistedWorkflowRecord(runId: string) {
+  recoverPendingWorkflowCommit(path.join(runsDir(), runId));
   try {
     const raw: unknown = JSON.parse(
       fs.readFileSync(path.join(runsDir(), runId, "workflow.json"), "utf8"),

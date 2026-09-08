@@ -14,6 +14,7 @@ import type {
 } from "@earendil-works/pi-ai/compat";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai/compat";
 import { emptyUsage } from "../usage.ts";
+import { ConnectFrameReader } from "./connect-frame-reader.ts";
 import {
   CURSOR_API_URL,
   CURSOR_CLIENT_VERSION,
@@ -84,6 +85,7 @@ const CONNECT_COMPRESSED_FLAG = 0b00000001;
 const MAX_CONNECT_FRAME_BYTES = 16 * 1024 * 1024;
 const HEARTBEAT_INTERVAL_MS = 5_000;
 const PROXY_TUNNEL_TIMEOUT_MS = 30_000;
+const MAX_NATIVE_EXEC_REJECTIONS = 3;
 
 export const CURSOR_CHAT_ONLY_SYSTEM_PROMPT =
   "This Cursor provider is running in chat-only mode. No filesystem, shell, code modification, MCP, web, or user-interaction tools are available. Never emit tool calls or interaction queries. Images attached to the user message are already available for direct analysis. If required information is unavailable, explain the limitation in text instead of attempting a tool.";
@@ -678,17 +680,6 @@ function errorFromEndStream(data: Uint8Array): Error | undefined {
   }
 }
 
-function isAbortError(
-  error: unknown,
-  signal: AbortSignal | undefined,
-): boolean {
-  return (
-    Boolean(signal?.aborted) ||
-    (error instanceof Error &&
-      /aborted|cancelled|canceled/i.test(error.message))
-  );
-}
-
 /** Cursor AgentService/Run with Pi-owned tool execution across provider turns. */
 export function streamCursor(
   model: Model<Api>,
@@ -723,6 +714,7 @@ export function streamCursor(
     let finished = false;
     const pendingCalls = new Map<string, ToolCall>();
     let handingOffTools = false;
+    let nativeExecRejections = 0;
 
     const closeBlocks = () => {
       if (currentText) {
@@ -751,9 +743,9 @@ export function streamCursor(
       if (finished) return;
       finished = true;
       closeBlocks();
-      output.stopReason = isAbortError(error, options?.signal)
-        ? "aborted"
-        : "error";
+      // Peer resets and server cancellation messages are transport failures.
+      // Only the caller's signal establishes a locally requested interruption.
+      output.stopReason = options?.signal?.aborted ? "aborted" : "error";
       output.errorMessage =
         error instanceof Error ? error.message : String(error);
       stream.push({
@@ -833,15 +825,19 @@ export function streamCursor(
           h2Request?.close(http2.constants.NGHTTP2_CANCEL);
         }, requestTimeoutMs);
       };
-      let frameBuffer: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+      const frames = new ConnectFrameReader(MAX_CONNECT_FRAME_BYTES);
       const processFrame = (flags: number, bytes: Uint8Array) => {
-        if (handingOffTools) return;
+        if (handingOffTools || terminalError) return;
         if ((flags & CONNECT_COMPRESSED_FLAG) !== 0) {
           throw new Error("Compressed Cursor Connect frames are unsupported");
         }
         if ((flags & CONNECT_END_STREAM_FLAG) !== 0) {
           terminalError = errorFromEndStream(bytes);
-          if (terminalError) h2Request?.close();
+          if (terminalError) {
+            // Preserve the server's error before close emits an aborted event.
+            settle(terminalError);
+            h2Request?.close();
+          }
           return;
         }
         const message = fromBinary(AgentServerMessageSchema, bytes);
@@ -962,17 +958,31 @@ export function streamCursor(
               ? "Cursor requested unsupported native execution outside Pi"
               : "Cursor requested a tool that is unavailable in chat-only mode",
           );
-          terminalError = error;
           if (!h2Request) {
             settle(error);
             return;
+          }
+          // Like OMP's sendExecClientThrow, reject this exec frame in band.
+          // streamClose closes the rejected exec, not AgentService/Run: the
+          // model may recover by requesting one of the advertised Pi tools.
+          const recover =
+            Boolean(context.tools?.length) &&
+            ++nativeExecRejections <= MAX_NATIVE_EXEC_REJECTIONS;
+          if (!recover) {
+            terminalError = context.tools?.length
+              ? new Error(
+                  `Cursor native execution recovery limit (${MAX_NATIVE_EXEC_REJECTIONS}) exceeded; last exec id ${exec.id}`,
+                )
+              : error;
           }
           h2Request.write(
             frameConnectMessage(toBinary(AgentClientMessageSchema, throwReply)),
           );
           h2Request.write(
             frameConnectMessage(toBinary(AgentClientMessageSchema, closeReply)),
-            () => settle(error),
+            () => {
+              if (!recover) settle(terminalError);
+            },
           );
           return;
         }
@@ -991,22 +1001,14 @@ export function streamCursor(
           context.tools?.length &&
           (update.message.case === "partialToolCall" ||
             update.message.case === "toolCallStarted" ||
-            update.message.case === "toolCallCompleted")
+            update.message.case === "toolCallCompleted" ||
+            update.message.case === "toolCallDelta")
         ) {
-          const preview = update.message.value.toolCall;
-          if (preview && preview.tool.case !== "mcpToolCall") {
-            throw new Error(
-              "Cursor-native tools are unavailable; use the advertised Pi MCP tools",
-            );
-          }
           // Only exec mcpArgs is an invocation. UI previews may be partial,
           // duplicated, or emitted for approval probes, and never execute.
+          // Native previews are not an execution request either. Wait for its
+          // exec frame so we can reject it with the correct protocol identity.
           return;
-        }
-        if (context.tools?.length && update.message.case === "toolCallDelta") {
-          throw new Error(
-            "Cursor-native tool deltas are unavailable; use the advertised Pi MCP tools",
-          );
         }
         processInteraction(
           message.message.value,
@@ -1033,23 +1035,9 @@ export function streamCursor(
         );
       };
       const processData = (chunk: Buffer) => {
-        frameBuffer =
-          frameBuffer.length === 0
-            ? chunk
-            : Buffer.concat([frameBuffer, chunk]);
-        while (frameBuffer.length >= 5) {
-          const size = frameBuffer.readUInt32BE(1);
-          if (size > MAX_CONNECT_FRAME_BYTES) {
-            throw new Error(
-              `Cursor Connect frame exceeds ${MAX_CONNECT_FRAME_BYTES} bytes`,
-            );
-          }
-          if (frameBuffer.length < size + 5) return;
-          const flags = frameBuffer[0]!;
-          const data = frameBuffer.subarray(5, size + 5);
-          frameBuffer = frameBuffer.subarray(size + 5);
-          processFrame(flags, data);
-        }
+        frames.push(chunk, processFrame);
+        // Preserve tool batching while a complete header awaits its body.
+        if (frames.awaitingPayload) return;
         if (pendingCalls.size > 0 && !handingOffTools) {
           if (terminalError) throw terminalError;
           if (options?.signal?.aborted)
@@ -1158,7 +1146,7 @@ export function streamCursor(
           .then(() => {
             if (!responseSeen)
               throw new Error("Cursor response headers were not received");
-            if (frameBuffer.length !== 0)
+            if (frames.incomplete)
               throw new Error("Incomplete Cursor Connect frame");
             settle();
           })
