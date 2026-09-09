@@ -4,23 +4,26 @@ import { existsSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import type {
-  ExtensionAPI,
-  ExtensionContext,
-  KeybindingsManager,
-} from "@earendil-works/pi-coding-agent";
+import type { KeybindingsManager } from "@earendil-works/pi-coding-agent";
 import type { EditorComponent } from "@earendil-works/pi-tui";
-import imagePaste, {
+import {
+  collapseClipboardPaths,
   ImageAttachmentEditor,
   ImageAttachmentStore,
-  transformImageAttachmentInput,
 } from "../../../extensions/image-paste/index.ts";
+
+const created: string[] = [];
 
 function temporaryImage(extension: "jpg" | "png", bytes: string) {
   const path = join(tmpdir(), `pi-clipboard-${randomUUID()}.${extension}`);
   writeFileSync(path, bytes);
+  created.push(path);
   return path;
 }
+
+test.after(() => {
+  for (const path of created) rmSync(path, { force: true });
+});
 
 class FakeEditor implements EditorComponent {
   focused = false;
@@ -87,85 +90,83 @@ class FakeEditor implements EditorComponent {
 
 const keybindings = {
   matches: (data: string, action: string) =>
-    (data === "BACKSPACE" && action === "tui.editor.deleteCharBackward") ||
-    (data === "ALT_ENTER" && action === "app.message.followUp"),
+    data === "BACKSPACE" && action === "tui.editor.deleteCharBackward",
 } as unknown as KeybindingsManager;
 
-type Handler = (event: unknown, ctx: ExtensionContext) => unknown;
-
-function imagePasteHarness(attachments: ImageAttachmentStore) {
-  const handlers = new Map<string, Handler[]>();
-  const pi = {
-    on(event: string, handler: Handler) {
-      handlers.set(event, [...(handlers.get(event) ?? []), handler]);
-    },
-  } as unknown as ExtensionAPI;
-  const ctx = {
-    ui: {
-      notify() {},
-    },
-  } as unknown as ExtensionContext;
-  imagePaste(pi, attachments);
-
-  return {
-    async emit(event: string, value: unknown) {
-      let result: unknown;
-      for (const handler of handlers.get(event) ?? []) {
-        result = await handler(value, ctx);
-      }
-      return result;
-    },
-  };
-}
-
-test("clipboard images become compact ordered placeholders and native image content", () => {
-  const first = temporaryImage("png", "first");
-  const second = temporaryImage("jpg", "second");
+function harness() {
   const store = new ImageAttachmentStore();
   const base = new FakeEditor();
   const editor = new ImageAttachmentEditor(base, keybindings, store);
+  const submitted: string[] = [];
+  editor.onSubmit = (text) => submitted.push(text);
+  return { store, base, editor, submitted };
+}
+
+/**
+ * Mirrors Pi's InteractiveMode.handleFollowUp(): it reads the text through
+ * getExpandedText() *before* choosing a delivery path, and only the idle branch
+ * reaches onSubmit. The streaming and compaction branches hand the text to
+ * prompt()/queueCompactionMessage() directly.
+ */
+function handleFollowUp(
+  editor: ImageAttachmentEditor,
+  branch: "idle" | "streaming" | "compacting",
+) {
+  const text = editor.getExpandedText().trim();
+  if (!text) return undefined;
+  if (branch === "idle") {
+    editor.setText("");
+    editor.onSubmit?.(text);
+    return text;
+  }
+  editor.setText("");
+  return text;
+}
+
+test("clipboard paths display as compact placeholders while editing", () => {
+  const first = temporaryImage("png", "first");
+  const second = temporaryImage("jpg", "second");
+  const { editor } = harness();
 
   editor.insertTextAtCursor("before ");
   editor.insertTextAtCursor(first);
   editor.insertTextAtCursor(" between ");
   editor.insertTextAtCursor(second);
-  assert.equal(editor.getText(), "before [Image #1] between [Image #2]");
 
-  let transformed: ReturnType<typeof transformImageAttachmentInput> | undefined;
-  editor.onSubmit = (text) => {
-    transformed = transformImageAttachmentInput(store, {
-      text,
-      source: "interactive",
-    });
-  };
+  assert.equal(editor.getText(), "before [Image #1] between [Image #2]");
+});
+
+test("submission expands placeholders back to the original clipboard paths", () => {
+  const first = temporaryImage("png", "first");
+  const second = temporaryImage("jpg", "second");
+  const { base, editor, submitted } = harness();
+
+  editor.insertTextAtCursor("before ");
+  editor.insertTextAtCursor(first);
+  editor.insertTextAtCursor(" between ");
+  editor.insertTextAtCursor(second);
   base.submit();
 
-  assert.equal(transformed?.text, "before [Image #1] between [Image #2]");
-  assert.deepEqual(
-    transformed?.images.map(({ data, mimeType }) => ({ data, mimeType })),
-    [
-      { data: Buffer.from("first").toString("base64"), mimeType: "image/png" },
-      {
-        data: Buffer.from("second").toString("base64"),
-        mimeType: "image/jpeg",
-      },
-    ],
-  );
-  assert.equal(existsSync(first), false);
-  assert.equal(existsSync(second), false);
+  // Pi's own contract: the message text carries real paths so the read tool can
+  // open them. The placeholder is a display concern and never leaves the editor.
+  assert.equal(submitted[0], `before ${first} between ${second}`);
+});
 
-  const nextPrompt = temporaryImage("png", "next");
-  editor.insertTextAtCursor(nextPrompt);
-  assert.equal(editor.getText(), "[Image #1]");
-  store.cleanup();
-  assert.equal(existsSync(nextPrompt), false);
+test("submitted clipboard files are left on disk for the read tool", () => {
+  const path = temporaryImage("png", "kept");
+  const { base, editor } = harness();
+
+  editor.insertTextAtCursor(path);
+  base.submit();
+
+  // Pi never deletes clipboard images; preserving that keeps the path valid
+  // for later turns, including after a compaction retry.
+  assert.equal(existsSync(path), true);
 });
 
 test("backspace anywhere in an image placeholder removes it atomically", () => {
   const path = temporaryImage("png", "image");
-  const store = new ImageAttachmentStore();
-  const base = new FakeEditor();
-  const editor = new ImageAttachmentEditor(base, keybindings, store);
+  const { base, editor } = harness();
 
   editor.insertTextAtCursor("left ");
   editor.insertTextAtCursor(path);
@@ -176,191 +177,51 @@ test("backspace anywhere in an image placeholder removes it atomically", () => {
   assert.equal(editor.getText(), "left  right");
   assert.equal(base.cursor, "left ".length);
   assert.equal(base.setTextCalls, 0);
-  assert.equal(existsSync(path), false);
 });
 
-test("Alt+Enter paths retain images after Pi clears the editor first", () => {
-  for (const pathKind of ["idle", "streaming"] as const) {
-    const path = temporaryImage("png", pathKind);
-    const store = new ImageAttachmentStore();
-    const base = new FakeEditor();
-    const editor = new ImageAttachmentEditor(base, keybindings, store);
+test("a removed placeholder is not expanded on submission", () => {
+  const path = temporaryImage("png", "image");
+  const { base, editor, submitted } = harness();
 
-    editor.insertTextAtCursor("send ");
-    editor.insertTextAtCursor(path);
-    const submittedText = editor.getText();
-    editor.handleInput("ALT_ENTER");
-    editor.setText("");
-
-    let transformed: ReturnType<typeof transformImageAttachmentInput>;
-    if (pathKind === "idle") {
-      editor.onSubmit = (text) => {
-        transformed = transformImageAttachmentInput(store, {
-          text,
-          source: "interactive",
-        });
-      };
-      editor.onSubmit(submittedText);
-    } else {
-      transformed = transformImageAttachmentInput(store, {
-        text: submittedText,
-        source: "interactive",
-      });
-    }
-
-    assert.equal(transformed?.text, "send [Image #1]");
-    assert.equal(
-      transformed?.images[0]?.data,
-      Buffer.from(pathKind).toString("base64"),
-    );
-    assert.equal(existsSync(path), false);
-  }
-});
-
-test("submitted images survive until Pi emits the delayed input event", async () => {
-  const path = temporaryImage("png", "delayed");
-  const store = new ImageAttachmentStore();
-  const base = new FakeEditor();
-  const editor = new ImageAttachmentEditor(base, keybindings, store);
-
-  editor.insertTextAtCursor("describe ");
+  editor.insertTextAtCursor("keep ");
   editor.insertTextAtCursor(path);
-  const submittedText = editor.getText();
-  editor.onSubmit = async () => {};
+  base.cursor = editor.getText().length;
+  editor.handleInput("BACKSPACE");
   base.submit();
 
-  // Pi may queue the text in pendingUserInputs and resolve onSubmit before its
-  // main loop reaches session.prompt(), which is where the input event fires.
-  await Promise.resolve();
-  const transformed = transformImageAttachmentInput(store, {
-    text: submittedText,
-    source: "interactive",
-  });
-
-  assert.equal(transformed?.text, "describe [Image #1]");
-  assert.equal(
-    transformed?.images[0]?.data,
-    Buffer.from("delayed").toString("base64"),
-  );
-  assert.equal(existsSync(path), false);
-});
-
-test("a compaction retry discards attachment ownership before later input", async () => {
-  const path = temporaryImage("png", "compaction");
-  const store = new ImageAttachmentStore();
-  const harness = imagePasteHarness(store);
-  const base = new FakeEditor();
-  const editor = new ImageAttachmentEditor(base, keybindings, store);
-
-  editor.insertTextAtCursor(path);
-  editor.onSubmit = async () => {};
-  base.submit();
-
-  // Pi's compaction retry path sends the queued text with steer()/followUp(),
-  // bypassing the input event that would normally consume this submission.
-  await harness.emit("session_compact", { willRetry: true });
-  const transformed = await harness.emit("input", {
-    text: "[Image #1]",
-    source: "interactive",
-  });
-
-  assert.deepEqual(transformed, { action: "continue" });
-  assert.equal(existsSync(path), false);
-});
-
-test("placeholder text cannot select a different pending submission", () => {
-  const path = temporaryImage("png", "pending");
-  const store = new ImageAttachmentStore();
-  const base = new FakeEditor();
-  const editor = new ImageAttachmentEditor(base, keybindings, store);
-
-  editor.insertTextAtCursor("describe ");
-  editor.insertTextAtCursor(path);
-  editor.onSubmit = async () => {};
-  base.submit();
-
-  const transformed = transformImageAttachmentInput(store, {
-    text: "Explain the literal token [Image #1]",
-    source: "interactive",
-  });
-
-  assert.equal(transformed, undefined);
+  assert.equal(submitted[0], "keep");
   assert.equal(existsSync(path), true);
-  store.cleanup();
-  assert.equal(existsSync(path), false);
-});
-
-test("streaming Alt+Enter survives an asynchronous preceding input handler", async () => {
-  const path = temporaryImage("png", "async-handler");
-  const store = new ImageAttachmentStore();
-  const base = new FakeEditor();
-  const editor = new ImageAttachmentEditor(base, keybindings, store);
-
-  editor.insertTextAtCursor("send ");
-  editor.insertTextAtCursor(path);
-  const submittedText = editor.getText();
-  editor.handleInput("ALT_ENTER");
-  editor.setText("");
-
-  // ExtensionRunner awaits input handlers in registration order. An earlier
-  // asynchronous handler must not let editor cleanup win the race.
-  await new Promise((resolve) => setTimeout(resolve, 10));
-  const transformed = transformImageAttachmentInput(store, {
-    text: submittedText,
-    source: "interactive",
-  });
-
-  assert.equal(transformed?.text, "send [Image #1]");
-  assert.equal(
-    transformed?.images[0]?.data,
-    Buffer.from("async-handler").toString("base64"),
-  );
-  assert.equal(existsSync(path), false);
 });
 
 test("ordinary paths and unregistered placeholder text stay ordinary text", () => {
-  const store = new ImageAttachmentStore();
-  const base = new FakeEditor();
-  const editor = new ImageAttachmentEditor(base, keybindings, store);
+  const { base, editor, submitted } = harness();
 
   editor.insertTextAtCursor("/tmp/example.png [Image #1]");
   assert.equal(editor.getText(), "/tmp/example.png [Image #1]");
-  assert.equal(
-    transformImageAttachmentInput(store, {
-      text: editor.getText(),
-      source: "interactive",
-    }),
-    undefined,
-  );
+  base.submit();
+
+  assert.equal(submitted[0], "/tmp/example.png [Image #1]");
 });
 
 test("duplicating a placeholder makes both copies ordinary text", () => {
   const path = temporaryImage("png", "image");
-  const store = new ImageAttachmentStore();
-  const base = new FakeEditor();
-  const editor = new ImageAttachmentEditor(base, keybindings, store);
+  const { base, editor, submitted } = harness();
 
   editor.insertTextAtCursor(path);
   editor.insertTextAtCursor(" [Image #1]");
-
   assert.equal(editor.getText(), "[Image #1] [Image #1]");
-  assert.equal(existsSync(path), false);
-  assert.equal(
-    transformImageAttachmentInput(store, {
-      text: editor.getText(),
-      source: "interactive",
-    }),
-    undefined,
-  );
+  base.submit();
+
+  // An ambiguous token cannot own a path, so neither copy expands.
+  assert.equal(submitted[0], "[Image #1] [Image #1]");
+  assert.equal(existsSync(path), true);
 });
 
 test("deleting the last image makes its number available to the next paste", () => {
   const first = temporaryImage("png", "first");
   const second = temporaryImage("png", "second");
   const third = temporaryImage("png", "third");
-  const store = new ImageAttachmentStore();
-  const base = new FakeEditor();
-  const editor = new ImageAttachmentEditor(base, keybindings, store);
+  const { base, editor, submitted } = harness();
 
   editor.insertTextAtCursor(first);
   editor.insertTextAtCursor(" ");
@@ -370,21 +231,20 @@ test("deleting the last image makes its number available to the next paste", () 
   base.cursor = editor.getText().length;
   editor.handleInput("BACKSPACE");
   assert.equal(editor.getText(), "[Image #1] ");
-  assert.equal(existsSync(second), false);
 
   base.cursor = editor.getText().length;
   editor.insertTextAtCursor(third);
   assert.equal(editor.getText(), "[Image #1] [Image #2]");
-  store.cleanup();
+
+  base.submit();
+  assert.equal(submitted[0], `${first} ${third}`);
 });
 
 test("deleting an earlier image does not reorder later image numbers", () => {
   const first = temporaryImage("png", "first");
   const second = temporaryImage("png", "second");
   const third = temporaryImage("png", "third");
-  const store = new ImageAttachmentStore();
-  const base = new FakeEditor();
-  const editor = new ImageAttachmentEditor(base, keybindings, store);
+  const { base, editor, submitted } = harness();
 
   editor.insertTextAtCursor(first);
   editor.insertTextAtCursor(" ");
@@ -397,57 +257,194 @@ test("deleting an earlier image does not reorder later image numbers", () => {
   editor.insertTextAtCursor(" ");
   editor.insertTextAtCursor(third);
   assert.equal(editor.getText(), " [Image #2] [Image #3]");
-  store.cleanup();
-});
 
-test("a failed image read removes the dangling placeholder", () => {
-  const path = temporaryImage("png", "image");
-  const store = new ImageAttachmentStore();
-  const base = new FakeEditor();
-  const editor = new ImageAttachmentEditor(base, keybindings, store);
-
-  editor.insertTextAtCursor("before ");
-  editor.insertTextAtCursor(path);
-  editor.insertTextAtCursor(" after");
-  const text = editor.getText();
-  const submissionId = store.beginSubmission(text);
-  assert.notEqual(submissionId, undefined);
-  rmSync(path, { force: true });
-
-  const transformed = transformImageAttachmentInput(store, {
-    text,
-    source: "interactive",
-  });
-  assert.equal(transformed?.text, "before  after");
-  assert.deepEqual(transformed?.images, []);
-  assert.deepEqual(transformed?.failures, ["[Image #1]"]);
-});
-
-test("removing the draft or ending the session cleans temporary images", async () => {
-  const removed = temporaryImage("png", "removed");
-  const pending = temporaryImage("png", "pending");
-  const shutdown = temporaryImage("png", "shutdown");
-  const store = new ImageAttachmentStore();
-  const base = new FakeEditor();
-  const editor = new ImageAttachmentEditor(base, keybindings, store);
-
-  editor.insertTextAtCursor(removed);
-  editor.setText("");
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  assert.equal(existsSync(removed), false);
-
-  editor.insertTextAtCursor(pending);
-  editor.onSubmit = async () => {};
   base.submit();
-  await Promise.resolve();
-  assert.equal(existsSync(pending), true);
+  assert.equal(submitted[0], `${second} ${third}`);
+});
 
-  editor.insertTextAtCursor(shutdown);
-  store.cleanup();
-  assert.equal(existsSync(pending), false);
-  assert.equal(existsSync(shutdown), false);
+test("consecutive submissions do not leak placeholders across drafts", () => {
+  const first = temporaryImage("png", "first");
+  const second = temporaryImage("png", "second");
+  const { base, editor, submitted } = harness();
 
-  rmSync(removed, { force: true });
-  rmSync(pending, { force: true });
-  rmSync(shutdown, { force: true });
+  editor.insertTextAtCursor(first);
+  base.submit();
+  editor.insertTextAtCursor(second);
+  assert.equal(editor.getText(), "[Image #1]");
+  base.submit();
+
+  assert.equal(submitted[0], first);
+  assert.equal(submitted[1], second);
+});
+
+test("clearing the editor drops placeholder ownership", () => {
+  const path = temporaryImage("png", "cleared");
+  const { editor, base, submitted } = harness();
+
+  editor.insertTextAtCursor(path);
+  editor.setText("");
+  editor.setText("[Image #1]");
+  base.submit();
+
+  // The token no longer maps to anything, so it is submitted verbatim.
+  assert.equal(submitted[0], "[Image #1]");
+  assert.equal(existsSync(path), true);
+});
+
+test("Alt+Enter expands paths on every followUp branch", () => {
+  // Pi reads getExpandedText() before it picks a delivery path, and only the
+  // idle branch reaches onSubmit. All three must carry real paths.
+  for (const branch of ["idle", "streaming", "compacting"] as const) {
+    const path = temporaryImage("png", branch);
+    const { editor } = harness();
+
+    editor.insertTextAtCursor("describe ");
+    editor.insertTextAtCursor(path);
+    assert.equal(editor.getText(), "describe [Image #1]");
+
+    const delivered = handleFollowUp(editor, branch);
+    assert.equal(delivered, `describe ${path}`);
+  }
+});
+
+test("Alt+Enter on the idle branch does not double expand via onSubmit", () => {
+  const path = temporaryImage("png", "idle-once");
+  const { editor, submitted } = harness();
+
+  editor.insertTextAtCursor(path);
+  handleFollowUp(editor, "idle");
+
+  // setText("") clears the mapping before onSubmit runs, and the text is
+  // already expanded, so the downstream callback must see exactly one path.
+  assert.equal(submitted.length, 1);
+  assert.equal(submitted[0], path);
+});
+
+test("getExpandedText does not mutate the draft", () => {
+  const path = temporaryImage("png", "pure");
+  const { editor, base, submitted } = harness();
+
+  editor.insertTextAtCursor(path);
+  assert.equal(editor.getExpandedText(), path);
+  assert.equal(editor.getExpandedText(), path);
+  // Rendering and status reads must leave the collapsed buffer intact.
+  assert.equal(editor.getText(), "[Image #1]");
+  base.submit();
+  assert.equal(submitted[0], path);
+});
+
+test("getExpandedText leaves ambiguous placeholders collapsed", () => {
+  const path = temporaryImage("png", "ambiguous");
+  const { editor } = harness();
+
+  editor.insertTextAtCursor(path);
+  editor.insertTextAtCursor(" [Image #1]");
+
+  assert.equal(editor.getExpandedText(), "[Image #1] [Image #1]");
+});
+
+test("the transcript renders submitted clipboard paths as placeholders", () => {
+  const path = temporaryImage("png", "transcript");
+
+  assert.equal(
+    collapseClipboardPaths(`${path} can you see this image?`),
+    "[Image #1] can you see this image?",
+  );
+});
+
+test("transcript numbering follows the order paths appear", () => {
+  const first = temporaryImage("png", "first");
+  const second = temporaryImage("jpg", "second");
+
+  assert.equal(
+    collapseClipboardPaths(`before ${first} between ${second} after`),
+    "before [Image #1] between [Image #2] after",
+  );
+});
+
+test("adjacent pasted paths collapse into separate placeholders", () => {
+  // Pasting images back to back leaves no separator between the paths, so a
+  // greedy directory match would absorb the next path and show one image.
+  const first = temporaryImage("png", "adjacent-first");
+  const second = temporaryImage("jpg", "adjacent-second");
+  const third = temporaryImage("png", "adjacent-third");
+
+  assert.equal(
+    collapseClipboardPaths(`${first}${second}`),
+    "[Image #1][Image #2]",
+  );
+  assert.equal(
+    collapseClipboardPaths(`${first}${second}${third}`),
+    "[Image #1][Image #2][Image #3]",
+  );
+  assert.equal(
+    collapseClipboardPaths(`${first}${second}can you see these?`),
+    "[Image #1][Image #2]can you see these?",
+  );
+});
+
+test("adjacent posix paths collapse into separate placeholders", () => {
+  // The Windows boundary is a drive letter, the POSIX one is a bare slash;
+  // both have to end the previous match rather than extend it.
+  const first = `/tmp/pi-clipboard-${randomUUID()}.png`;
+  const second = `/tmp/pi-clipboard-${randomUUID()}.png`;
+
+  assert.equal(
+    collapseClipboardPaths(`${first}${second}`),
+    "[Image #1][Image #2]",
+  );
+});
+
+test("a path repeated in one message keeps a single transcript number", () => {
+  const path = temporaryImage("png", "repeated");
+
+  assert.equal(
+    collapseClipboardPaths(`${path} and again ${path}`),
+    "[Image #1] and again [Image #1]",
+  );
+});
+
+test("a submitted draft round-trips back to the placeholders that were typed", () => {
+  const path = temporaryImage("png", "round-trip");
+  const { editor, base, submitted } = harness();
+
+  editor.insertTextAtCursor(path);
+  editor.insertTextAtCursor(" can you see this image?");
+  const displayed = editor.getText();
+  base.submit();
+
+  // The model receives the real path, the transcript shows what was typed.
+  assert.equal(submitted[0], `${path} can you see this image?`);
+  assert.equal(collapseClipboardPaths(submitted[0]), displayed);
+});
+
+test("two images pasted back to back round-trip through submission", () => {
+  const first = temporaryImage("png", "pair-first");
+  const second = temporaryImage("jpg", "pair-second");
+  const { editor, base, submitted } = harness();
+
+  editor.insertTextAtCursor(first);
+  editor.insertTextAtCursor(second);
+  const displayed = editor.getText();
+  assert.equal(displayed, "[Image #1][Image #2]");
+  base.submit();
+
+  assert.equal(submitted[0], `${first}${second}`);
+  assert.equal(collapseClipboardPaths(submitted[0]), displayed);
+});
+
+test("transcript collapsing leaves ordinary paths and other temp files alone", () => {
+  const unrelated = join(tmpdir(), "pi-clipboard-notes.txt");
+  const ordinary = join(tmpdir(), "screenshot.png");
+  const text = `see ${ordinary} and ${unrelated}`;
+
+  assert.equal(collapseClipboardPaths(text), text);
+});
+
+test("transcript collapsing does not need the file to still exist", () => {
+  // Rendering runs for reloaded and forked sessions long after the temp file
+  // may have been cleaned up by the operating system.
+  const missing = join(tmpdir(), `pi-clipboard-${randomUUID()}.png`);
+
+  assert.equal(collapseClipboardPaths(`look ${missing}`), "look [Image #1]");
 });

@@ -1,7 +1,6 @@
-import { readFileSync, rmSync, statSync } from "node:fs";
+import { statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, extname, resolve } from "node:path";
-import type { ImageContent } from "@earendil-works/pi-ai";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -20,6 +19,19 @@ import {
 const IMAGE_PLACEHOLDER = /\[Image #(\d+)\]/g;
 const PI_CLIPBOARD_IMAGE =
   /^pi-clipboard-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(gif|jpe?g|png|webp)$/i;
+/**
+ * Locate clipboard image paths inside already-submitted text.
+ *
+ * Pasting two images produces adjacent paths with no separator between them,
+ * so the directory portion is matched as discrete segments that exclude both
+ * path separators and `:`, and it is lazy rather than greedy. A greedy middle
+ * absorbs the next path's `C:` or `/tmp` and renders the pair as one
+ * placeholder; laziness ends each match at the first filename that completes
+ * it, which is exactly the boundary between two pasted images.
+ */
+const CLIPBOARD_PATH_IN_TEXT =
+  /(?:[A-Za-z]:[\\/]|[\\/])(?:[^\s\\/:"'<>|]+[\\/])*?pi-clipboard-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(?:gif|jpe?g|png|webp)/gi;
+const IMAGE_EXTENSIONS = new Set([".gif", ".jpg", ".jpeg", ".png", ".webp"]);
 const LEFT_INPUT = "\u001b[D";
 const RIGHT_INPUT = "\u001b[C";
 
@@ -27,13 +39,6 @@ interface Attachment {
   readonly id: number;
   readonly placeholder: string;
   readonly path: string;
-  readonly mimeType: string;
-}
-
-interface Submission {
-  readonly id: number;
-  readonly text: string;
-  readonly attachments: readonly Attachment[];
 }
 
 function normalizedPath(path: string) {
@@ -41,23 +46,8 @@ function normalizedPath(path: string) {
   return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 
-function mimeTypeForPath(path: string) {
-  switch (extname(path).toLowerCase()) {
-    case ".gif":
-      return "image/gif";
-    case ".jpg":
-    case ".jpeg":
-      return "image/jpeg";
-    case ".png":
-      return "image/png";
-    case ".webp":
-      return "image/webp";
-    default:
-      return undefined;
-  }
-}
-
 function isPiClipboardImage(path: string) {
+  if (!IMAGE_EXTENSIONS.has(extname(path).toLowerCase())) return false;
   if (normalizedPath(dirname(path)) !== normalizedPath(tmpdir())) return false;
   if (!PI_CLIPBOARD_IMAGE.test(basename(path))) return false;
   try {
@@ -67,12 +57,33 @@ function isPiClipboardImage(path: string) {
   }
 }
 
-function removeTemporaryImage(path: string) {
-  try {
-    rmSync(path, { force: true });
-  } catch {
-    // Cleanup is best effort; never turn an editor action into a crash.
-  }
+/**
+ * Collapse clipboard image paths back into compact placeholders for display.
+ *
+ * Submission deliberately expands placeholders into real paths so the model can
+ * read the file, which would otherwise push issue #413's long temp paths from
+ * the editor into the transcript. This runs at render time only and is
+ * deliberately stateless: numbering follows the order the paths appear in the
+ * message, so replays, forks and reloaded sessions all render identically
+ * without any mapping having to survive the submission.
+ *
+ * The number can differ from what the editor showed if images were deleted
+ * mid-draft. Transcript numbering only distinguishes images within one message,
+ * so that is accepted rather than carried through message metadata.
+ */
+export function collapseClipboardPaths(text: string) {
+  let next = 1;
+  const assigned = new Map<string, string>();
+  return text.replace(CLIPBOARD_PATH_IN_TEXT, (match) => {
+    if (!PI_CLIPBOARD_IMAGE.test(basename(match))) return match;
+    // A path repeated in one message keeps a single number: the transcript
+    // shows the same image, so a second number would imply a second image.
+    const existing = assigned.get(match);
+    if (existing) return existing;
+    const placeholder = `[Image #${next++}]`;
+    assigned.set(match, placeholder);
+    return placeholder;
+  });
 }
 
 function placeholderOccurrences(text: string) {
@@ -83,31 +94,53 @@ function placeholderOccurrences(text: string) {
   }));
 }
 
+/**
+ * Replace each placeholder that appears exactly once with its clipboard path.
+ * Ambiguous tokens stay collapsed so user-edited text is never over-expanded.
+ */
+function expandWith(text: string, attachments: Iterable<Attachment>) {
+  const entries = [...attachments];
+  if (entries.length === 0) return text;
+  const occurrenceCounts = new Map<number, number>();
+  for (const occurrence of placeholderOccurrences(text)) {
+    occurrenceCounts.set(
+      occurrence.id,
+      (occurrenceCounts.get(occurrence.id) ?? 0) + 1,
+    );
+  }
+  let expanded = text;
+  for (const attachment of entries) {
+    if (occurrenceCounts.get(attachment.id) !== 1) continue;
+    expanded = expanded.replaceAll(attachment.placeholder, attachment.path);
+  }
+  return expanded;
+}
+
+/**
+ * Display-only registry mapping compact placeholders to the clipboard paths Pi
+ * inserted. This mirrors the editor's native long-paste markers: the buffer
+ * shows `[Image #1]`, submission expands it back to the real path, and the
+ * message Pi sends is byte-identical to unmodified Pi.
+ *
+ * Nothing here owns the temporary file. Pi leaves clipboard images in tmpdir so
+ * the read tool can still open them later, and that contract is preserved.
+ */
 export class ImageAttachmentStore {
   private nextAttachmentId = 1;
-  private nextSubmissionId = 1;
   private readonly draft = new Map<number, Attachment>();
-  private readonly pending = new Map<number, Submission>();
 
   get hasDraft() {
     return this.draft.size > 0;
   }
 
   attachClipboardPath(path: string, editorText: string) {
-    const mimeType = mimeTypeForPath(path);
-    if (!mimeType || !isPiClipboardImage(path)) return undefined;
+    if (!isPiClipboardImage(path)) return undefined;
 
     let id = this.nextAttachmentId;
     while (this.draft.has(id) || editorText.includes(`[Image #${id}]`)) id += 1;
     const placeholder = `[Image #${id}]`;
-    const attachment = {
-      id,
-      placeholder,
-      path,
-      mimeType,
-    } satisfies Attachment;
     this.nextAttachmentId = id + 1;
-    this.draft.set(attachment.id, attachment);
+    this.draft.set(id, { id, placeholder, path } satisfies Attachment);
     return placeholder;
   }
 
@@ -119,85 +152,41 @@ export class ImageAttachmentStore {
         (occurrenceCounts.get(occurrence.id) ?? 0) + 1,
       );
     }
-    for (const [id, attachment] of this.draft) {
+    for (const id of [...this.draft.keys()]) {
       // Placeholder text is user-editable, so only an unambiguous single
-      // occurrence may retain ownership of a temporary image. Duplicated or
-      // removed tokens become ordinary text and the image is cleaned up.
+      // occurrence keeps its mapping. Duplicated or removed tokens degrade to
+      // ordinary text; the underlying file is left alone either way.
       if (occurrenceCounts.get(id) === 1) continue;
       this.draft.delete(id);
-      removeTemporaryImage(attachment.path);
     }
     this.nextAttachmentId =
       this.draft.size === 0 ? 1 : Math.max(...this.draft.keys()) + 1;
   }
 
-  beginSubmission(text: string) {
-    this.reconcileDraft(text);
-    const attachments = [...this.draft.values()];
-    if (attachments.length === 0) return undefined;
+  /**
+   * Expand every unambiguously tracked placeholder back to its clipboard path,
+   * matching the editor's own `expandPasteMarkers` behaviour at submission time.
+   *
+   * This is a pure query: Pi calls getExpandedText() for rendering and status
+   * as well as for submission, so expansion must never mutate the draft.
+   * Expanding an already expanded string is a no-op, which keeps the
+   * getExpandedText() and onSubmit paths safe to combine.
+   */
+  expandPlaceholders(text: string) {
+    return expandWith(text, this.draft.values());
+  }
+
+  /**
+   * Copy the current mapping so a submission can still expand after the editor
+   * has cleared the buffer and released the draft.
+   */
+  snapshotDraft() {
+    return this.draft.size === 0 ? undefined : [...this.draft.values()];
+  }
+
+  clearDraft() {
     this.draft.clear();
     this.nextAttachmentId = 1;
-    const submission = {
-      id: this.nextSubmissionId,
-      text,
-      attachments,
-    } satisfies Submission;
-    this.nextSubmissionId += 1;
-    this.pending.set(submission.id, submission);
-    return submission.id;
-  }
-
-  finishSubmission(id: number) {
-    const submission = this.pending.get(id);
-    if (!submission) return;
-    this.pending.delete(id);
-    for (const attachment of submission.attachments) {
-      removeTemporaryImage(attachment.path);
-    }
-  }
-
-  discardPendingSubmissions() {
-    for (const submission of this.pending.values()) {
-      for (const attachment of submission.attachments) {
-        removeTemporaryImage(attachment.path);
-      }
-    }
-    this.pending.clear();
-  }
-
-  consumeSubmission(text: string) {
-    // Pi preserves interactive submission order. Consume that lifecycle-owned
-    // identity instead of letting repeated placeholder text select any older
-    // pending attachment.
-    const submission = this.pending.values().next().value;
-    if (!submission || submission.text !== text) return undefined;
-    this.pending.delete(submission.id);
-
-    const ordered = [...submission.attachments].sort(
-      (left, right) =>
-        text.indexOf(left.placeholder) - text.indexOf(right.placeholder),
-    );
-    const images: ImageContent[] = [];
-    const failures: string[] = [];
-    let transformedText = text;
-    for (const attachment of ordered) {
-      try {
-        images.push({
-          type: "image",
-          data: readFileSync(attachment.path).toString("base64"),
-          mimeType: attachment.mimeType,
-        });
-      } catch {
-        failures.push(attachment.placeholder);
-        transformedText = transformedText.replaceAll(
-          attachment.placeholder,
-          "",
-        );
-      } finally {
-        removeTemporaryImage(attachment.path);
-      }
-    }
-    return { text: transformedText, images, failures };
   }
 
   attachmentHit(
@@ -219,13 +208,7 @@ export class ImageAttachmentStore {
   }
 
   cleanup() {
-    for (const attachment of this.draft.values()) {
-      removeTemporaryImage(attachment.path);
-    }
-    this.draft.clear();
-    this.discardPendingSubmissions();
-    this.nextAttachmentId = 1;
-    this.nextSubmissionId = 1;
+    this.clearDraft();
   }
 }
 
@@ -252,7 +235,7 @@ export class ImageAttachmentEditor extends BelowEditorNavigationEditor {
   private readonly attachments: ImageAttachmentStore;
   private downstreamChange?: (text: string) => void;
   private downstreamSubmit?: (text: string) => void;
-  private preparedSubmissionId?: number;
+  private submittedDraft?: readonly Attachment[];
   private settingText = false;
 
   constructor(
@@ -282,14 +265,17 @@ export class ImageAttachmentEditor extends BelowEditorNavigationEditor {
   override set onChange(value: ((text: string) => void) | undefined) {
     this.downstreamChange = value;
     super.onChange = (text) => {
-      if (this.settingText) {
-        this.downstreamChange?.(text);
-        return;
-      }
-      if (text.length === 0 && this.attachments.hasDraft) {
-        setTimeout(() => this.attachments.reconcileDraft(this.getText()), 0);
-      } else {
-        this.attachments.reconcileDraft(text);
+      if (!this.settingText) {
+        // submitValue() clears the buffer and reports it here before invoking
+        // onSubmit, so an empty buffer ends the draft and restarts numbering.
+        // Keep a snapshot so the submit that caused it can still expand.
+        if (text.length === 0) {
+          this.submittedDraft = this.attachments.snapshotDraft();
+          this.attachments.clearDraft();
+        } else {
+          this.submittedDraft = undefined;
+          this.attachments.reconcileDraft(text);
+        }
       }
       this.downstreamChange?.(text);
     };
@@ -303,29 +289,30 @@ export class ImageAttachmentEditor extends BelowEditorNavigationEditor {
     this.downstreamSubmit = value;
     super.onSubmit = value
       ? (text) => {
-          const submissionId =
-            this.preparedSubmissionId ?? this.attachments.beginSubmission(text);
-          let outcome: unknown;
-          try {
-            outcome = value(text);
-          } catch (error) {
-            if (submissionId !== undefined) {
-              this.attachments.finishSubmission(submissionId);
-            }
-            throw error;
-          }
-          if (submissionId !== undefined) {
-            // A fulfilled Pi submit callback only means that the editor accepted
-            // the text. The interactive loop may have queued it and emit the
-            // input event later, so successful settlement is not terminal
-            // evidence for the attachment. Input consumption owns success
-            // cleanup; rejection and session shutdown own the other paths.
-            void Promise.resolve(outcome).catch(() =>
-              this.attachments.finishSubmission(submissionId),
-            );
-          }
+          // Plain Enter reaches here after submitValue() already cleared the
+          // buffer, so expand against the snapshot taken at that moment. Paths
+          // that read getExpandedText() first pass real paths in, and expanding
+          // an already expanded string is a no-op.
+          const snapshot = this.submittedDraft;
+          this.submittedDraft = undefined;
+          value(
+            snapshot
+              ? expandWith(text, snapshot)
+              : this.attachments.expandPlaceholders(text),
+          );
         }
       : undefined;
+  }
+
+  /**
+   * Pi reads the submitted text through this seam before it picks a delivery
+   * path -- handleFollowUp() calls it ahead of prompt(), queueCompactionMessage()
+   * and onSubmit alike. Expanding here is what keeps every Alt+Enter branch
+   * from shipping a bare `[Image #1]`.
+   */
+  override getExpandedText() {
+    const base = super.getExpandedText?.() ?? this.getText();
+    return this.attachments.expandPlaceholders(base);
   }
 
   override setText(text: string) {
@@ -337,8 +324,8 @@ export class ImageAttachmentEditor extends BelowEditorNavigationEditor {
     }
     if (text.length > 0) {
       this.attachments.reconcileDraft(text);
-    } else if (this.attachments.hasDraft) {
-      setTimeout(() => this.attachments.reconcileDraft(this.getText()), 0);
+    } else {
+      this.attachments.clearDraft();
     }
   }
 
@@ -375,23 +362,6 @@ export class ImageAttachmentEditor extends BelowEditorNavigationEditor {
 
   override handleInput(data: string) {
     if (
-      this.attachments.hasDraft &&
-      this.editorKeybindings.matches(data, "app.message.followUp")
-    ) {
-      // Alt+Enter reaches this editor before Pi clears it, but its streaming
-      // path bypasses onSubmit. Move ownership at the key action boundary.
-      const submissionId = this.attachments.beginSubmission(
-        this.getText().trim(),
-      );
-      this.preparedSubmissionId = submissionId;
-      try {
-        super.handleInput(data);
-      } finally {
-        this.preparedSubmissionId = undefined;
-      }
-      return;
-    }
-    if (
       (this.editorKeybindings.matches(data, "tui.editor.deleteCharBackward") ||
         matchesKey(data, "shift+backspace")) &&
       this.deleteAttachment(data, "backward")
@@ -407,24 +377,6 @@ export class ImageAttachmentEditor extends BelowEditorNavigationEditor {
     }
     super.handleInput(data);
   }
-}
-
-export function transformImageAttachmentInput(
-  attachments: ImageAttachmentStore,
-  event: {
-    text: string;
-    images?: ImageContent[];
-    source: string;
-  },
-) {
-  if (event.source !== "interactive") return undefined;
-  const consumed = attachments.consumeSubmission(event.text);
-  if (!consumed) return undefined;
-  return {
-    text: consumed.text,
-    images: [...(event.images ?? []), ...consumed.images],
-    failures: consumed.failures,
-  };
 }
 
 function installImagePasteEditor(
@@ -445,33 +397,18 @@ export default function imagePaste(
   pi: ExtensionAPI,
   attachments = new ImageAttachmentStore(),
 ) {
+  // Rendering-only counterpart to submission expansion: the model still
+  // receives real paths, while the transcript keeps the compact placeholders
+  // that issue #413 asked for. Restricted to user messages so paths the
+  // assistant legitimately quotes are left untouched.
+  pi.registerMarkdownTransformer((markdown, context) =>
+    context.messageType === "user"
+      ? collapseClipboardPaths(markdown)
+      : markdown,
+  );
+
   pi.on("session_start", (_event, ctx) => {
     installImagePasteEditor(pi, ctx, attachments);
-  });
-
-  pi.on("input", (event, ctx) => {
-    const transformed = transformImageAttachmentInput(attachments, event);
-    if (!transformed) return { action: "continue" };
-    for (const placeholder of transformed.failures) {
-      ctx.ui.notify(
-        `${placeholder} could not be read and was not attached`,
-        "warning",
-      );
-    }
-    return {
-      action: "transform",
-      text: transformed.text,
-      images: transformed.images,
-    };
-  });
-
-  pi.on("session_compact", (event) => {
-    if (event.willRetry) {
-      // InteractiveMode flushes retry-bound compaction messages through
-      // steer()/followUp(), which bypasses the input event. Those submissions
-      // therefore cannot retain attachment ownership.
-      attachments.discardPendingSubmissions();
-    }
   });
 
   pi.on("session_shutdown", () => {
