@@ -63,6 +63,7 @@ function editorLifecycleHarness() {
       registerCommand() {},
       registerMessageRenderer() {},
       registerEntryRenderer() {},
+      registerMarkdownTransformer() {},
       getThinkingLevel: () => "off",
       sendMessage() {},
       appendEntry() {},
