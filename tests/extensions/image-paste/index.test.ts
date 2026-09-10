@@ -30,6 +30,7 @@ class FakeEditor implements EditorComponent {
   text = "";
   cursor = 0;
   setTextCalls = 0;
+  history: string[] = [];
   onSubmit?: (text: string) => void;
   onChange?: (text: string) => void;
 
@@ -64,6 +65,10 @@ class FakeEditor implements EditorComponent {
       this.text.slice(0, this.cursor) + text + this.text.slice(this.cursor);
     this.cursor += text.length;
     this.onChange?.(this.text);
+  }
+
+  addToHistory(text: string) {
+    this.history.push(text);
   }
 
   handleInput(data: string) {
@@ -447,4 +452,86 @@ test("transcript collapsing does not need the file to still exist", () => {
   const missing = join(tmpdir(), `pi-clipboard-${randomUUID()}.png`);
 
   assert.equal(collapseClipboardPaths(`look ${missing}`), "look [Image #1]");
+});
+
+test("transcript collapsing only claims files Pi wrote to the temp directory", () => {
+  // A project file that merely shares the clipboard basename is not ours, and
+  // hiding its real location would misrepresent what the user sent.
+  const elsewhere = join(
+    "/home/user/assets",
+    `pi-clipboard-${randomUUID()}.png`,
+  );
+
+  assert.equal(collapseClipboardPaths(elsewhere), elsewhere);
+});
+
+test("transcript collapsing preserves markdown link and image targets", () => {
+  const path = temporaryImage("png", "target");
+
+  assert.equal(
+    collapseClipboardPaths(`![diagram](${path})`),
+    `![diagram](${path})`,
+  );
+});
+
+test("transcript collapsing leaves code spans verbatim", () => {
+  const path = temporaryImage("png", "code");
+  const fenced = `\`\`\`bash\ncp ${path} ./out.png\n\`\`\``;
+
+  assert.equal(collapseClipboardPaths(fenced), fenced);
+  assert.equal(collapseClipboardPaths(`\`${path}\``), `\`${path}\``);
+});
+
+test("prose still collapses when the same message contains a code block", () => {
+  const shown = temporaryImage("png", "prose");
+  const quoted = temporaryImage("png", "quoted");
+
+  assert.equal(
+    collapseClipboardPaths(`${shown}\n\`\`\`\n${quoted}\n\`\`\``),
+    `[Image #1]\n\`\`\`\n${quoted}\n\`\`\``,
+  );
+});
+
+test("dequeued messages come back as placeholders and expand again", () => {
+  // Pi queues getExpandedText() and restores it through setText(), so without
+  // adopting those paths the editor would show issue #413's long temp path.
+  const path = temporaryImage("png", "queued");
+  const { editor } = harness();
+
+  editor.insertTextAtCursor(path);
+  const queued = handleFollowUp(editor, "compacting");
+  assert.equal(queued, path);
+
+  editor.setText(queued ?? "");
+
+  assert.equal(editor.getText(), "[Image #1]");
+  assert.equal(editor.getExpandedText(), path);
+});
+
+test("dequeuing several images renumbers them in order", () => {
+  const first = temporaryImage("png", "queued-first");
+  const second = temporaryImage("jpg", "queued-second");
+  const { editor } = harness();
+
+  editor.setText(`${first}${second} still there?`);
+
+  assert.equal(editor.getText(), "[Image #1][Image #2] still there?");
+  assert.equal(editor.getExpandedText(), `${first}${second} still there?`);
+});
+
+test("history recall restores compact placeholders and expands again", () => {
+  const path = temporaryImage("png", "history");
+  const { base, editor } = harness();
+
+  // Pi stores getExpandedText() into history — the real path.
+  editor.addToHistory(`${path} do you see it?`);
+  assert.deepEqual(base.history, [`${path} do you see it?`]);
+
+  // Up-arrow recall uses setTextInternal which bypasses setText and only
+  // fires onChange. Simulate that by writing directly to the base editor.
+  base.text = base.history[0];
+  base.onChange?.(base.text);
+
+  assert.equal(editor.getText(), "[Image #1] do you see it?");
+  assert.equal(editor.getExpandedText(), `${path} do you see it?`);
 });

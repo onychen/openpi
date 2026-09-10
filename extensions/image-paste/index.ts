@@ -46,15 +46,55 @@ function normalizedPath(path: string) {
   return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 
-function isPiClipboardImage(path: string) {
+/**
+ * Directories a Pi clipboard image can legitimately come from.
+ *
+ * The local temp directory covers the running host. The generic POSIX and
+ * Windows temp shapes are also accepted because a transcript is rendered on
+ * whatever machine reopens the session, which is not always the one that
+ * pasted the image. An arbitrary project directory is still rejected, so a file
+ * that merely shares the basename keeps its real path on screen.
+ */
+const PORTABLE_TEMP_DIRECTORY =
+  /^(?:[\\/](?:tmp|private[\\/](?:tmp|var[\\/]folders[\\/][^\\/]+[\\/][^\\/]+[\\/]T)|var[\\/]folders[\\/][^\\/]+[\\/][^\\/]+[\\/]T)|[A-Za-z]:[\\/](?:Users[\\/][^\\/]+[\\/]AppData[\\/]Local[\\/]Temp|Windows[\\/]Temp|Temp))$/i;
+
+function isTemporaryDirectory(directory: string) {
+  if (normalizedPath(directory) === normalizedPath(tmpdir())) return true;
+  return PORTABLE_TEMP_DIRECTORY.test(directory.replace(/[\\/]+$/, ""));
+}
+
+/**
+ * Provenance check shared by attachment tracking and transcript collapsing:
+ * the file must carry Pi's clipboard name and sit directly in a temp
+ * directory. Deliberately free of disk access so an already-sent message still
+ * collapses after the OS has reclaimed the file.
+ */
+function isPiClipboardPath(path: string) {
   if (!IMAGE_EXTENSIONS.has(extname(path).toLowerCase())) return false;
-  if (normalizedPath(dirname(path)) !== normalizedPath(tmpdir())) return false;
-  if (!PI_CLIPBOARD_IMAGE.test(basename(path))) return false;
+  if (!isTemporaryDirectory(dirname(path))) return false;
+  return PI_CLIPBOARD_IMAGE.test(basename(path));
+}
+
+function isPiClipboardImage(path: string) {
+  if (!isPiClipboardPath(path)) return false;
   try {
     return statSync(path).isFile();
   } catch {
     return false;
   }
+}
+
+/**
+ * Spans that must survive verbatim: fenced blocks and inline code are quoted
+ * source, and a rewritten path there stops being copy-pasteable.
+ */
+const MARKDOWN_VERBATIM = /```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]*`/g;
+
+function verbatimSpans(text: string) {
+  return [...text.matchAll(MARKDOWN_VERBATIM)].map((match) => ({
+    start: match.index,
+    end: match.index + match[0].length,
+  }));
 }
 
 /**
@@ -67,15 +107,30 @@ function isPiClipboardImage(path: string) {
  * message, so replays, forks and reloaded sessions all render identically
  * without any mapping having to survive the submission.
  *
+ * Rewriting is bounded by provenance and by Markdown structure. Only files Pi
+ * itself wrote into the temp directory are collapsed, so an unrelated path that
+ * merely shares the basename keeps its full text. Fenced blocks, inline code
+ * and link/image targets are left untouched, because collapsing a `](...)`
+ * target would break the very image it points at.
+ *
  * The number can differ from what the editor showed if images were deleted
  * mid-draft. Transcript numbering only distinguishes images within one message,
  * so that is accepted rather than carried through message metadata.
  */
 export function collapseClipboardPaths(text: string) {
+  const skip = verbatimSpans(text);
   let next = 1;
   const assigned = new Map<string, string>();
-  return text.replace(CLIPBOARD_PATH_IN_TEXT, (match) => {
-    if (!PI_CLIPBOARD_IMAGE.test(basename(match))) return match;
+  return text.replace(CLIPBOARD_PATH_IN_TEXT, (match, offset: number) => {
+    if (!isPiClipboardPath(match)) return match;
+    if (skip.some((span) => offset >= span.start && offset < span.end)) {
+      return match;
+    }
+    // `](path)` is a link or image target; replacing it silently breaks the
+    // reference, so the path stays literal even though it is a clipboard file.
+    if (text.startsWith("](", Math.max(0, offset - 2)) && offset >= 2) {
+      return match;
+    }
     // A path repeated in one message keeps a single number: the transcript
     // shows the same image, so a second number would imply a second image.
     const existing = assigned.get(match);
@@ -189,6 +244,36 @@ export class ImageAttachmentStore {
     this.nextAttachmentId = 1;
   }
 
+  /**
+   * Rebuild the mapping from text that already contains real clipboard paths
+   * and return its collapsed form.
+   *
+   * Pi hands expanded text back to the editor on paths this extension does not
+   * own: handleDequeue() restores queued messages through setText(), and
+   * history recall replays what addToHistory() stored. Without adopting those
+   * paths the buffer would show issue #413's long temp path again and the
+   * tokens would no longer expand on the next submit.
+   */
+  adoptExpandedText(text: string) {
+    const paths = [...text.matchAll(CLIPBOARD_PATH_IN_TEXT)]
+      .map((match) => match[0])
+      .filter((path) => isPiClipboardPath(path));
+    if (paths.length === 0) return undefined;
+
+    this.clearDraft();
+    let collapsed = text;
+    for (const path of paths) {
+      if ([...this.draft.values()].some((entry) => entry.path === path)) {
+        continue;
+      }
+      const id = this.nextAttachmentId++;
+      const placeholder = `[Image #${id}]`;
+      this.draft.set(id, { id, placeholder, path } satisfies Attachment);
+      collapsed = collapsed.replaceAll(path, placeholder);
+    }
+    return collapsed;
+  }
+
   attachmentHit(
     text: string,
     cursor: number,
@@ -274,7 +359,22 @@ export class ImageAttachmentEditor extends BelowEditorNavigationEditor {
           this.attachments.clearDraft();
         } else {
           this.submittedDraft = undefined;
-          this.attachments.reconcileDraft(text);
+          // History recall uses setTextInternal (bypasses setText) and only
+          // fires onChange. When there is no draft but the text contains
+          // clipboard paths, adopt them so the buffer shows compact tokens.
+          const adopted =
+            !this.attachments.hasDraft &&
+            this.attachments.adoptExpandedText(text);
+          if (adopted) {
+            this.settingText = true;
+            try {
+              super.setText(adopted);
+            } finally {
+              this.settingText = false;
+            }
+          } else {
+            this.attachments.reconcileDraft(text);
+          }
         }
       }
       this.downstreamChange?.(text);
@@ -316,14 +416,21 @@ export class ImageAttachmentEditor extends BelowEditorNavigationEditor {
   }
 
   override setText(text: string) {
+    // Pi restores queued messages and history entries as expanded paths. Adopt
+    // them so the buffer shows compact tokens and the next submit can expand
+    // again; ordinary text falls through to plain reconciliation.
+    const adopted =
+      text.length > 0 ? this.attachments.adoptExpandedText(text) : undefined;
+    const next = adopted ?? text;
     this.settingText = true;
     try {
-      super.setText(text);
+      super.setText(next);
     } finally {
       this.settingText = false;
     }
-    if (text.length > 0) {
-      this.attachments.reconcileDraft(text);
+    if (adopted !== undefined) return;
+    if (next.length > 0) {
+      this.attachments.reconcileDraft(next);
     } else {
       this.attachments.clearDraft();
     }
