@@ -1602,3 +1602,423 @@ it("preserves an edited recovered draft when late evidence arrives", () => {
   expect(input.value).toBe("edited");
   expect(acknowledge).toHaveBeenCalledWith("unknown-command");
 });
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((next) => {
+    resolve = next;
+  });
+  return { promise, resolve };
+}
+
+it("keeps a retyped draft when an earlier send settles", async () => {
+  const result = deferred<boolean>();
+  const store = createWebStore();
+  const sendPrompt = vi.fn(() => result.promise);
+  const snapshot = activeSnapshot();
+  snapshot.runtime.status = "idle";
+  const props = {
+    snapshot,
+    selectedPath: "/tmp/session",
+    selectedWorkspace: "/tmp",
+    sessionSwitching: false,
+    promptAdmissionPending: false,
+    liveRunning: false,
+    landing: false,
+    activeTurn: null,
+    turnCancellationPending: false,
+    turnTerminalStatus: null,
+    pendingFollowUpsReceipt: null,
+    thinkingPendingLevel: null,
+    actions: { ...store.getState().actions, sendPrompt },
+  };
+  renderWithI18n(createElement(Composer, props));
+  const input = screen.getByRole<HTMLTextAreaElement>("textbox");
+
+  fireEvent.change(input, { target: { value: "first" } });
+  fireEvent.click(screen.getByRole("button", { name: i18n.t("send") }));
+  fireEvent.change(input, { target: { value: "second" } });
+  fireEvent.change(input, { target: { value: "first" } });
+
+  await act(async () => {
+    result.resolve(true);
+    await result.promise;
+  });
+
+  expect(input.value).toBe("first");
+});
+
+it("keeps a draft after a failed send", async () => {
+  const result = deferred<boolean>();
+  const store = createWebStore();
+  const sendPrompt = vi.fn(() => result.promise);
+  const snapshot = activeSnapshot();
+  snapshot.runtime.status = "idle";
+  renderWithI18n(
+    createElement(Composer, {
+      snapshot,
+      selectedPath: "/tmp/session",
+      selectedWorkspace: "/tmp",
+      sessionSwitching: false,
+      promptAdmissionPending: false,
+      liveRunning: false,
+      landing: false,
+      activeTurn: null,
+      turnCancellationPending: false,
+      turnTerminalStatus: null,
+      pendingFollowUpsReceipt: null,
+      thinkingPendingLevel: null,
+      actions: { ...store.getState().actions, sendPrompt },
+    }),
+  );
+  const input = screen.getByRole<HTMLTextAreaElement>("textbox");
+
+  fireEvent.change(input, { target: { value: "keep me" } });
+  fireEvent.click(screen.getByRole("button", { name: i18n.t("send") }));
+  await act(async () => {
+    result.resolve(false);
+    await result.promise;
+  });
+
+  expect(input.value).toBe("keep me");
+});
+
+it("clears an old session draft without letting its late send clear the new one", async () => {
+  const result = deferred<boolean>();
+  const store = createWebStore();
+  const sendPrompt = vi.fn(() => result.promise);
+  const snapshot = activeSnapshot();
+  snapshot.runtime.status = "idle";
+  const props = {
+    snapshot,
+    selectedPath: "/tmp/session",
+    selectedWorkspace: "/tmp",
+    sessionSwitching: false,
+    promptAdmissionPending: false,
+    liveRunning: false,
+    landing: false,
+    activeTurn: null,
+    turnCancellationPending: false,
+    turnTerminalStatus: null,
+    pendingFollowUpsReceipt: null,
+    thinkingPendingLevel: null,
+    actions: { ...store.getState().actions, sendPrompt },
+  };
+  const view = renderWithI18n(createElement(Composer, props));
+  const input = screen.getByRole<HTMLTextAreaElement>("textbox");
+  fireEvent.change(input, { target: { value: "old session" } });
+  fireEvent.click(screen.getByRole("button", { name: i18n.t("send") }));
+
+  const nextSnapshot = {
+    ...snapshot,
+    currentSessionId: "next-session",
+    selectedSession: {
+      ...snapshot.selectedSession!,
+      id: "next-session",
+      path: "/tmp/next-session",
+    },
+  };
+  view.rerender(
+    createElement(
+      I18nextProvider,
+      { i18n },
+      createElement(Composer, {
+        ...props,
+        snapshot: nextSnapshot,
+        selectedPath: "/tmp/next-session",
+      }),
+    ),
+  );
+  expect(input.value).toBe("");
+
+  fireEvent.change(input, { target: { value: "new session" } });
+  await act(async () => {
+    result.resolve(true);
+    await result.promise;
+  });
+
+  expect(input.value).toBe("new session");
+});
+
+it("clears an active Session draft when switching to another workspace", () => {
+  const store = createWebStore();
+  const snapshot = activeSnapshot();
+  snapshot.workspaces = [
+    { path: "/tmp", name: "A", current: true },
+    { path: "/tmp/other", name: "B", current: false },
+  ];
+  const props = {
+    snapshot,
+    selectedPath: "/tmp/session",
+    selectedWorkspace: "/tmp",
+    sessionSwitching: false,
+    promptAdmissionPending: false,
+    liveRunning: false,
+    landing: false,
+    activeTurn: null,
+    turnCancellationPending: false,
+    turnTerminalStatus: null,
+    pendingFollowUpsReceipt: null,
+    thinkingPendingLevel: null,
+    actions: store.getState().actions,
+  };
+  const view = renderWithI18n(createElement(Composer, props));
+  const input = screen.getByRole<HTMLTextAreaElement>("textbox");
+  fireEvent.change(input, { target: { value: "Session A draft" } });
+
+  view.rerender(
+    createElement(
+      I18nextProvider,
+      { i18n },
+      createElement(Composer, {
+        ...props,
+        selectedWorkspace: "/tmp/other",
+        workspaceDraft: true,
+        selectedPath: "/tmp/session",
+      }),
+    ),
+  );
+
+  expect(input.value).toBe("");
+});
+
+it("transfers an unsent draft through manual new-session creation", () => {
+  const store = createWebStore();
+  const snapshot = activeSnapshot();
+  const props = {
+    snapshot,
+    selectedPath: "/tmp/session",
+    selectedWorkspace: "/tmp",
+    sessionSwitching: false,
+    promptAdmissionPending: false,
+    liveRunning: false,
+    landing: false,
+    activeTurn: null,
+    turnCancellationPending: false,
+    turnTerminalStatus: null,
+    pendingFollowUpsReceipt: null,
+    thinkingPendingLevel: null,
+    actions: store.getState().actions,
+  };
+  const view = renderWithI18n(createElement(Composer, props));
+  const input = screen.getByRole<HTMLTextAreaElement>("textbox");
+  fireEvent.change(input, { target: { value: "keep this draft" } });
+
+  view.rerender(
+    createElement(
+      I18nextProvider,
+      { i18n },
+      createElement(Composer, {
+        ...props,
+        workspaceDraft: true,
+        selectedPath: null,
+        sessionSwitching: true,
+      }),
+    ),
+  );
+  expect(input.value).toBe("keep this draft");
+
+  const createdSnapshot = {
+    ...snapshot,
+    currentSessionId: "created-session",
+    selectedSession: {
+      ...snapshot.selectedSession!,
+      id: "created-session",
+      path: "/tmp/created-session",
+    },
+  };
+  view.rerender(
+    createElement(
+      I18nextProvider,
+      { i18n },
+      createElement(Composer, {
+        ...props,
+        snapshot: createdSnapshot,
+        selectedPath: "/tmp/created-session",
+        sessionSwitching: false,
+      }),
+    ),
+  );
+  expect(input.value).toBe("keep this draft");
+});
+
+it("ignores a rapid second Enter while admission is pending", async () => {
+  const result = deferred<boolean>();
+  const store = createWebStore();
+  const sendPrompt = vi.fn(() => result.promise);
+  const snapshot = activeSnapshot();
+  snapshot.runtime.status = "idle";
+  renderWithI18n(
+    createElement(Composer, {
+      snapshot,
+      selectedPath: "/tmp/session",
+      selectedWorkspace: "/tmp",
+      sessionSwitching: false,
+      promptAdmissionPending: false,
+      liveRunning: false,
+      landing: false,
+      activeTurn: null,
+      turnCancellationPending: false,
+      turnTerminalStatus: null,
+      pendingFollowUpsReceipt: null,
+      thinkingPendingLevel: null,
+      actions: { ...store.getState().actions, sendPrompt },
+    }),
+  );
+  const input = screen.getByRole<HTMLTextAreaElement>("textbox");
+  fireEvent.change(input, { target: { value: "once" } });
+  fireEvent.keyDown(input, {
+    key: "Enter",
+    nativeEvent: { isComposing: false },
+  });
+  fireEvent.keyDown(input, {
+    key: "Enter",
+    nativeEvent: { isComposing: false },
+  });
+
+  expect(sendPrompt).toHaveBeenCalledOnce();
+  await act(async () => {
+    result.resolve(true);
+    await result.promise;
+  });
+  expect(input.value).toBe("");
+});
+
+it("transfers a new-session draft until its first send is accepted", async () => {
+  const result = deferred<boolean>();
+  const store = createWebStore();
+  const sendPrompt = vi.fn(() => result.promise);
+  const draftSnapshot = activeSnapshot();
+  draftSnapshot.runtime.status = "idle";
+  delete draftSnapshot.currentSessionId;
+  delete draftSnapshot.selectedSession;
+  draftSnapshot.sessions = [];
+  const props = {
+    snapshot: draftSnapshot,
+    selectedPath: null,
+    selectedWorkspace: "/tmp",
+    sessionSwitching: false,
+    promptAdmissionPending: false,
+    liveRunning: false,
+    landing: true,
+    activeTurn: null,
+    turnCancellationPending: false,
+    turnTerminalStatus: null,
+    pendingFollowUpsReceipt: null,
+    thinkingPendingLevel: null,
+    actions: { ...store.getState().actions, sendPrompt },
+  };
+  const view = renderWithI18n(createElement(Composer, props));
+  const input = screen.getByRole<HTMLTextAreaElement>("textbox");
+  fireEvent.change(input, { target: { value: "first prompt" } });
+  fireEvent.click(screen.getByRole("button", { name: i18n.t("send") }));
+
+  const createdSnapshot = {
+    ...draftSnapshot,
+    currentSessionId: "created-session",
+    selectedSession: {
+      id: "created-session",
+      path: "/tmp/created-session",
+      cwd: "/tmp",
+      entries: [],
+      bytes: 0,
+      truncation,
+    },
+  };
+  view.rerender(
+    createElement(
+      I18nextProvider,
+      { i18n },
+      createElement(Composer, {
+        ...props,
+        snapshot: createdSnapshot,
+        selectedPath: "/tmp/created-session",
+        sessionSwitching: true,
+        landing: false,
+      }),
+    ),
+  );
+  expect(input.value).toBe("first prompt");
+
+  await act(async () => {
+    result.resolve(true);
+    await result.promise;
+  });
+  expect(input.value).toBe("");
+});
+
+it("keeps a retyped recovery draft when sending as new settles", async () => {
+  const result = deferred<boolean>();
+  const store = createWebStore();
+  const sendPrompt = vi.fn(() => result.promise);
+  const snapshot = activeSnapshot();
+  snapshot.runtime.status = "idle";
+  const props = {
+    snapshot,
+    selectedPath: "/tmp/session",
+    selectedWorkspace: "/tmp",
+    sessionSwitching: false,
+    promptAdmissionPending: false,
+    promptAdmissionRecovery: {
+      sessionId: "session",
+      content: "first",
+      commandId: "unknown-command",
+      optimisticKey: "optimistic-unknown-command",
+      phase: "ready" as const,
+    },
+    liveRunning: false,
+    landing: false,
+    activeTurn: null,
+    turnCancellationPending: false,
+    turnTerminalStatus: null,
+    pendingFollowUpsReceipt: null,
+    thinkingPendingLevel: null,
+    actions: { ...store.getState().actions, sendPromptAsNew: sendPrompt },
+  };
+  renderWithI18n(createElement(Composer, props));
+  const input = screen.getByRole<HTMLTextAreaElement>("textbox");
+
+  fireEvent.change(input, { target: { value: "first" } });
+  fireEvent.click(screen.getByRole("button", { name: "Send as new message" }));
+  fireEvent.change(input, { target: { value: "second" } });
+  fireEvent.change(input, { target: { value: "first" } });
+
+  await act(async () => {
+    result.resolve(true);
+    await result.promise;
+  });
+
+  expect(input.value).toBe("first");
+});
+
+it("keeps the draft when a creation path arrives before failed canonical confirmation", async () => {
+  const result = deferred<boolean>();
+  const snapshot = idleThinkingSnapshot();
+  const base = thinkingProps(snapshot);
+  const props = {
+    ...base,
+    workspaceDraft: true,
+    selectedPath: null as string | null,
+    actions: { ...base.actions, sendPrompt: vi.fn(() => result.promise) },
+  };
+  const view = renderWithI18n(createElement(Composer, props));
+  const input = screen.getByRole<HTMLTextAreaElement>("textbox");
+  fireEvent.change(input, { target: { value: "keep creation draft" } });
+  fireEvent.click(screen.getByRole("button", { name: i18n.t("send") }));
+  view.rerender(
+    createElement(
+      I18nextProvider,
+      { i18n },
+      createElement(Composer, {
+        ...props,
+        selectedPath: "/tmp/created-session.jsonl",
+      }),
+    ),
+  );
+  expect(input.value).toBe("keep creation draft");
+  await act(async () => {
+    result.resolve(false);
+    await result.promise;
+  });
+  expect(input.value).toBe("keep creation draft");
+});

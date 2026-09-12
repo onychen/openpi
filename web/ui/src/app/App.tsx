@@ -201,6 +201,7 @@ export function App() {
           pendingFollowUpsReceipt={state.pendingFollowUpsReceipt}
           commandDiscovery={state.commandDiscovery}
           snapshot={state.snapshot}
+          selectedPath={state.selectedPath}
           selectedWorkspace={state.selectedWorkspace}
           sessionSwitching={state.sessionSwitching}
           promptAdmissionPending={state.promptAdmissionPending}

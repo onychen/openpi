@@ -31,6 +31,7 @@ interface ComposerProps {
   thinkingPendingLevel: WebStoreState["thinkingPendingLevel"];
   onInspect?: (terminalId?: string) => void;
   snapshot: WebSnapshot | null;
+  selectedPath?: string | null;
   selectedWorkspace: string | null;
   sessionSwitching: boolean;
   promptAdmissionPending: boolean;
@@ -67,6 +68,23 @@ export function Composer(props: ComposerProps) {
   const restoredRecoveryCommandId = useRef<string | null>(null);
   const commandMenuWasOpen = useRef(false);
   const selected = props.snapshot?.selectedSession;
+  const selectedPath =
+    props.selectedPath === undefined
+      ? (selected?.path ?? null)
+      : props.selectedPath;
+  const sessionPath =
+    selected?.cwd === props.selectedWorkspace ? selectedPath : null;
+  const draftScope =
+    (props.workspaceDraft ? null : sessionPath) ??
+    (props.selectedWorkspace ? `new:${props.selectedWorkspace}` : "none");
+  const draftScopeRef = useRef(draftScope);
+  const draftRevision = useRef(0);
+  const transferDraftToCreatedSession = useRef(false);
+  const pendingSubmission = useRef<{
+    revision: number;
+    scope: string;
+    canTransferToCreatedSession: boolean;
+  } | null>(null);
   const active = Boolean(
     !props.workspaceDraft &&
       selected?.id &&
@@ -164,13 +182,50 @@ export function Composer(props: ComposerProps) {
     props.actions.acknowledgePromptAdmissionResolution(resolution.commandId);
   }, [prompt, props.actions, props.promptAdmissionResolution]);
 
-  const clearPrompt = () => {
-    setPrompt("");
-    if (textarea.current) {
-      textarea.current.style.height = "auto";
-      textarea.current.style.overflowY = "hidden";
+  useEffect(() => {
+    const previousScope = draftScopeRef.current;
+    if (previousScope === draftScope) return;
+    draftScopeRef.current = draftScope;
+
+    const submission = pendingSubmission.current;
+    const createdSession =
+      !props.workspaceDraft &&
+      (transferDraftToCreatedSession.current ||
+        (submission?.canTransferToCreatedSession &&
+          submission.scope === previousScope)) &&
+      Boolean(sessionPath) &&
+      props.snapshot?.selectedSession?.path === sessionPath &&
+      props.snapshot?.selectedSession?.cwd === props.selectedWorkspace;
+    if (createdSession) {
+      if (submission?.canTransferToCreatedSession)
+        submission.scope = draftScope;
+      transferDraftToCreatedSession.current = false;
+      return;
     }
-  };
+
+    const startingNewSession =
+      props.workspaceDraft &&
+      props.selectedWorkspace &&
+      draftScope === `new:${props.selectedWorkspace}` &&
+      props.snapshot?.selectedSession?.cwd === props.selectedWorkspace;
+    if (startingNewSession) {
+      transferDraftToCreatedSession.current = true;
+      return;
+    }
+
+    draftRevision.current += 1;
+    setPrompt("");
+    if (submission?.scope === previousScope) {
+      submission.canTransferToCreatedSession = false;
+    }
+  }, [
+    draftScope,
+    props.snapshot?.selectedSession?.path,
+    props.snapshot?.selectedSession?.cwd,
+    props.selectedWorkspace,
+    props.workspaceDraft,
+    sessionPath,
+  ]);
 
   const resize = (element: HTMLTextAreaElement) => {
     element.style.height = "auto";
@@ -178,24 +233,53 @@ export function Composer(props: ComposerProps) {
     element.style.overflowY = element.scrollHeight > 220 ? "auto" : "hidden";
   };
 
-  const send = async (event?: FormEvent) => {
-    event?.preventDefault();
+  const sendDraft = async (
+    sendPrompt: (content: string) => Promise<boolean>,
+  ) => {
+    if (pendingSubmission.current) return;
     if (!props.selectedWorkspace) {
       await props.actions.chooseWorkspace();
       return;
     }
-    if (await props.actions.sendPrompt(prompt)) {
-      clearPrompt();
+    const submission = {
+      revision: draftRevision.current,
+      scope: draftScopeRef.current,
+      canTransferToCreatedSession: draftSession,
+    };
+    pendingSubmission.current = submission;
+    try {
+      if (await sendPrompt(prompt)) {
+        if (
+          pendingSubmission.current === submission &&
+          draftScopeRef.current === submission.scope &&
+          draftRevision.current === submission.revision
+        ) {
+          draftRevision.current += 1;
+          setPrompt("");
+          if (textarea.current) {
+            textarea.current.style.height = "auto";
+            textarea.current.style.overflowY = "hidden";
+          }
+        }
+      }
+    } finally {
+      if (pendingSubmission.current === submission) {
+        pendingSubmission.current = null;
+      }
     }
   };
 
-  const sendAsNew = async () => {
-    if (await props.actions.sendPromptAsNew(prompt)) clearPrompt();
+  const send = async (event?: FormEvent) => {
+    event?.preventDefault();
+    await sendDraft(props.actions.sendPrompt);
   };
+
+  const sendAsNew = () => sendDraft(props.actions.sendPromptAsNew);
 
   const completeCommand = (command: (typeof filteredCommands)[number]) => {
     if (command.availability !== "available") return;
     const value = `/${command.name} `;
+    draftRevision.current += 1;
     setPrompt(value);
     setCursor(value.length);
     setMenuDismissed(true);
@@ -418,6 +502,7 @@ export function Composer(props: ComposerProps) {
           }
           placeholder={placeholder}
           onChange={(event) => {
+            draftRevision.current += 1;
             setPrompt(event.target.value);
             setCursor(event.target.selectionStart);
             setMenuDismissed(false);
